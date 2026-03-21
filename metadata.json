@@ -1,0 +1,5 @@
+{
+  "name": "AI 错题分析与知识图谱",
+  "description": "上传错题照片，自动分析考察知识点、易错点及知识树。支持点击知识点获取详细讲解与相关例题。",
+  "requestFramePermissions": []
+}
