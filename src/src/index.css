@@ -1,0 +1,639 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: ui-sans-serif, system-ui, "Segoe UI", "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+}
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply antialiased text-slate-900;
+  }
+}
+
+@layer components {
+  .markdown-body {
+    @apply text-slate-700 leading-relaxed;
+  }
+
+  .markdown-body a {
+    @apply text-indigo-600 underline decoration-indigo-300 underline-offset-2 hover:text-indigo-800;
+  }
+
+  .markdown-body strong {
+    @apply font-semibold text-slate-900;
+  }
+
+  .markdown-invert {
+    @apply text-slate-200;
+  }
+
+  .markdown-invert a {
+    @apply text-indigo-300 decoration-indigo-500 hover:text-indigo-200;
+  }
+
+  .markdown-invert strong {
+    @apply font-semibold text-white;
+  }
+
+  .markdown-body-relaxed {
+    @apply text-[0.975rem] sm:text-base;
+  }
+}
+
+/* KaTeX 块级公式过长时横向滚动，避免撑破布局 */
+.katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 0.25rem;
+  max-width: 100%;
+}
+
+/* 若仍生成 .katex-mathml（旧缓存或其它入口），强制不占据版面，避免与 .katex-html 叠字 */
+.markdown-body .katex .katex-mathml {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  clip-path: inset(50%) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
+
+/* ===== OJ 风格「大树」（与 src/index.css 同步）===== */
+.st-oj-scroll {
+  overflow-x: auto;
+  overflow-y: visible;
+  -webkit-overflow-scrolling: touch;
+}
+
+.st-oj-forest {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 2.5rem;
+  min-width: min-content;
+  margin: 0;
+  padding: 1rem 1.5rem 3rem;
+  list-style: none;
+}
+
+.st-oj-forest > li {
+  flex: 0 0 auto;
+  list-style: none;
+}
+
+.st-oj-branch {
+  position: relative;
+  padding-top: 1.25rem;
+  margin: 0 auto;
+}
+
+.st-oj-branch::after {
+  content: '';
+  display: table;
+  clear: both;
+}
+
+.st-oj-branch li {
+  float: left;
+  text-align: center;
+  list-style-type: none;
+  position: relative;
+  padding: 1.25rem 0.35rem 0;
+}
+
+.st-oj-branch li::before,
+.st-oj-branch li::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 50%;
+  border-top: 2px solid rgb(45 212 191);
+  width: 50%;
+  height: 1.25rem;
+}
+
+.st-oj-branch li::after {
+  right: auto;
+  left: 50%;
+  border-left: 2px solid rgb(45 212 191);
+}
+
+.st-oj-branch li:only-child::before,
+.st-oj-branch li:only-child::after {
+  display: none;
+}
+
+.st-oj-branch li:only-child {
+  padding-top: 0;
+}
+
+.st-oj-branch li:first-child::before,
+.st-oj-branch li:last-child::after {
+  border: 0 none;
+}
+
+.st-oj-branch li:last-child::before {
+  border-right: 2px solid rgb(45 212 191);
+  border-radius: 0 0.375rem 0 0;
+}
+
+.st-oj-branch li:first-child::after {
+  border-radius: 0.375rem 0 0 0;
+}
+
+.st-oj-branch ul::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 50%;
+  border-left: 2px solid rgb(45 212 191);
+  width: 0;
+  height: 1.25rem;
+  transform: translateX(-50%);
+}
+
+.st-oj-root-card {
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.oj-knowledge-canvas {
+  background-color: rgb(248 250 252);
+  background-image: radial-gradient(circle, rgb(203 213 225 / 0.55) 1px, transparent 1px);
+  background-size: 14px 14px;
+}
+
+/* ===== 参考图风格知识图谱画布 ===== */
+.knowledge-map-frame {
+  position: relative;
+  width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  border: 1px solid rgb(226 232 240);
+  border-radius: 10px;
+  background:
+    linear-gradient(to bottom, rgb(255 255 255 / 0.96), rgb(248 251 255 / 0.96)),
+    radial-gradient(circle, rgb(191 213 236 / 0.62) 1.45px, transparent 1.6px);
+  background-size: auto, 58px 58px;
+  box-shadow: inset 0 -32px 46px rgb(20 184 166 / 0.08);
+}
+
+.knowledge-map-frame--tall {
+  overflow-y: auto;
+  max-height: min(92vh, 980px);
+}
+
+.knowledge-map-canvas {
+  position: relative;
+  min-width: 1100px;
+}
+
+.knowledge-map-lines {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.knowledge-map-edge {
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.knowledge-map-edge-green {
+  stroke: rgb(52 211 153);
+  opacity: 0.9;
+}
+
+.knowledge-map-edge-blue {
+  stroke: rgb(96 165 250);
+  opacity: 0.82;
+}
+
+.knowledge-map-edge-muted {
+  stroke: rgb(203 213 225);
+  opacity: 0.88;
+}
+
+.knowledge-map-node {
+  position: absolute;
+  z-index: 2;
+  display: flex;
+  min-width: 168px;
+  max-width: 220px;
+  min-height: 54px;
+  transform: translate(-50%, -50%);
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  border: 2px solid;
+  padding: 10px 18px 9px;
+  text-align: center;
+  transition:
+    transform 160ms ease,
+    box-shadow 160ms ease;
+}
+
+.knowledge-map-node:hover {
+  transform: translate(-50%, -50%) scale(1.045);
+}
+
+button.knowledge-map-node {
+  margin: 0;
+  font: inherit;
+  appearance: none;
+}
+
+.knowledge-map-node-interactive {
+  cursor: pointer;
+}
+
+.knowledge-map-node-active {
+  box-shadow:
+    0 0 0 3px rgb(16 185 129 / 0.38),
+    0 14px 28px rgb(16 185 129 / 0.16);
+}
+
+.knowledge-map-node-green {
+  border-color: rgb(16 185 129);
+  background: rgb(209 250 229 / 0.92);
+  color: rgb(4 120 87);
+  box-shadow:
+    0 14px 28px rgb(16 185 129 / 0.16),
+    0 0 28px rgb(16 185 129 / 0.2);
+}
+
+.knowledge-map-node-blue {
+  border-color: rgb(59 130 246);
+  background: rgb(219 234 254 / 0.9);
+  color: rgb(29 78 216);
+  box-shadow: 0 10px 22px rgb(59 130 246 / 0.12);
+}
+
+.knowledge-map-node-gray {
+  border-color: rgb(148 163 184);
+  background: rgb(248 250 252 / 0.92);
+  color: rgb(71 85 105);
+  box-shadow: 0 8px 18px rgb(100 116 139 / 0.1);
+}
+
+.knowledge-map-node-small {
+  min-width: 128px;
+  max-width: 160px;
+  min-height: 44px;
+  padding: 8px 14px 7px;
+}
+
+.knowledge-map-label {
+  display: block;
+  width: 100%;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.1;
+  letter-spacing: 0;
+}
+
+.knowledge-map-node-small .knowledge-map-label {
+  font-size: 12px;
+}
+
+.knowledge-map-bar {
+  display: block;
+  width: 54%;
+  height: 3px;
+  margin-top: 8px;
+  border-radius: 999px;
+  background: currentColor;
+  opacity: 0.48;
+}
+
+.knowledge-map-node-with-mastery {
+  min-height: 72px;
+  padding-bottom: 10px;
+}
+
+.knowledge-map-mastery-track {
+  display: block;
+  width: 76%;
+  height: 4px;
+  margin-top: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgb(0 0 0 / 0.08);
+}
+
+.knowledge-map-mastery-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: currentColor;
+  opacity: 0.85;
+  transition: width 0.45s ease;
+}
+
+.knowledge-map-mastery-text {
+  display: block;
+  margin-top: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  opacity: 0.92;
+  font-variant-numeric: tabular-nums;
+}
+
+.knowledge-map-plus {
+  position: absolute;
+  top: 8px;
+  right: 9px;
+  display: inline-flex;
+  width: 20px;
+  height: 20px;
+  align-items: center;
+  justify-content: center;
+  border: 1.5px solid rgb(59 130 246);
+  border-radius: 999px;
+  background: rgb(239 246 255);
+  color: rgb(37 99 235);
+}
+
+.knowledge-map-caption {
+  position: sticky;
+  left: 0;
+  margin: 0;
+  border-top: 1px solid rgb(226 232 240);
+  background: rgb(248 250 252 / 0.86);
+  padding: 12px 16px;
+  color: rgb(71 85 105);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* ===== AI-OJ 风格 SVG 知识树 ===== */
+.oj-tree-panel {
+  border: 1px solid rgb(226 232 240);
+  border-radius: 12px;
+  background: rgb(255 255 255 / 0.9);
+  padding: 12px;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.8);
+}
+
+.oj-tree-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px 16px;
+  margin-bottom: 8px;
+}
+
+.oj-tree-search {
+  width: 100%;
+  border: 1px solid rgb(226 232 240);
+  border-radius: 10px;
+  padding: 8px 12px 8px 36px;
+  font-size: 13px;
+  outline: none;
+}
+
+.oj-tree-search:focus {
+  border-color: rgb(59 130 246);
+  box-shadow: 0 0 0 3px rgb(59 130 246 / 0.15);
+}
+
+.oj-tree-search-dropdown {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  max-height: 240px;
+  overflow: auto;
+  border: 1px solid rgb(226 232 240);
+  border-radius: 10px;
+  background: white;
+  box-shadow: 0 8px 24px rgb(15 23 42 / 0.12);
+  padding: 4px;
+}
+
+.oj-tree-search-dropdown button {
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+}
+
+.oj-tree-search-dropdown button:hover {
+  background: rgb(241 245 249);
+}
+
+.oj-tree-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 16px;
+  font-size: 12px;
+  color: rgb(71 85 105);
+}
+
+.oj-tree-legend .dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-right: 4px;
+  vertical-align: middle;
+  border: 1px solid rgb(148 163 184);
+}
+
+.oj-tree-legend .dim { background: #f1f5f9; }
+.oj-tree-legend .mid { background: #cbd5e1; }
+.oj-tree-legend .bright { background: #60a5fa; }
+.oj-tree-legend .lit { background: #34d399; }
+
+.oj-tree-zoom-tip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  color: rgb(100 116 139);
+}
+
+.oj-tree-wrap {
+  position: relative;
+  min-height: 640px;
+  height: min(72vh, 720px);
+  width: 100%;
+  cursor: grab;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid rgb(226 232 240 / 0.8);
+  background: #fff;
+}
+
+.oj-tree-wrap:active {
+  cursor: grabbing;
+}
+
+.oj-tree-svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.admin-kbd {
+  display: inline-block;
+  padding: 0 5px;
+  border-radius: 4px;
+  border: 1px solid rgb(253 230 138);
+  background: rgb(255 255 255 / 0.8);
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+}
+
+/* 待审核 — 试卷式正文（与 Word/PDF 阅读顺序一致：题干 → 答案） */
+.exam-paper-sheet {
+  max-width: 48rem;
+  margin: 0 auto;
+  background: #fff;
+  border: 1px solid rgb(226 232 240);
+  border-radius: 0.5rem;
+  box-shadow:
+    0 1px 2px rgb(15 23 42 / 0.04),
+    0 8px 24px rgb(15 23 42 / 0.06);
+  padding: 1.75rem 2rem 2rem;
+  color: rgb(15 23 42);
+  font-size: 15px;
+  line-height: 1.75;
+}
+
+@media (min-width: 1280px) {
+  .exam-paper-sheet {
+    padding: 2rem 2.5rem 2.25rem;
+  }
+}
+
+.exam-paper-header {
+  text-align: center;
+  padding-bottom: 1rem;
+  margin-bottom: 1.25rem;
+  border-bottom: 1px solid rgb(226 232 240);
+}
+
+.exam-paper-header-title {
+  font-size: 1rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: rgb(30 41 59);
+}
+
+.exam-paper-header-sub {
+  margin-top: 0.25rem;
+  font-size: 0.8125rem;
+  color: rgb(100 116 139);
+}
+
+.exam-paper-section--question {
+  margin-bottom: 0;
+}
+
+.exam-paper-section--answer {
+  margin-top: 1.75rem;
+  padding-top: 1.25rem;
+  border-top: 1px dashed rgb(251 191 36 / 0.65);
+}
+
+.exam-paper-qno {
+  font-size: 1.0625rem;
+  font-weight: 700;
+  color: rgb(67 56 202);
+  margin-bottom: 0.75rem;
+  line-height: 1.4;
+}
+
+.exam-paper-answer-label {
+  font-size: 0.875rem;
+  font-weight: 700;
+  color: rgb(180 83 9);
+  margin-bottom: 0.75rem;
+}
+
+.exam-paper-body {
+  text-align: justify;
+  text-justify: inter-ideograph;
+}
+
+.exam-paper-body--answer {
+  color: rgb(69 26 3);
+}
+
+.exam-paper-line {
+  margin: 0 0 0.35rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.exam-paper-line--empty {
+  height: 0.75rem;
+}
+
+.exam-paper-line--option {
+  padding-left: 0.5rem;
+  text-indent: 0;
+}
+
+.exam-paper-line--subq {
+  padding-left: 1rem;
+  font-weight: 500;
+}
+
+.exam-paper-line--qno {
+  font-weight: 600;
+}
+
+.exam-paper-line--placeholder {
+  text-align: center;
+  color: rgb(148 163 184);
+  font-size: 0.8125rem;
+  padding: 0.5rem;
+  border: 1px dashed rgb(203 213 225);
+  border-radius: 0.375rem;
+  margin: 0.75rem 0;
+}
+
+.exam-paper-figure {
+  margin: 1rem auto;
+  max-width: 100%;
+  text-align: center;
+}
+
+.exam-paper-figure-img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 0.375rem;
+  border: 1px solid rgb(226 232 240);
+  background: #fff;
+  box-shadow: 0 1px 3px rgb(15 23 42 / 0.06);
+}
+
+.exam-paper-figure-cap {
+  margin-top: 0.35rem;
+  font-size: 0.75rem;
+  color: rgb(100 116 139);
+}
+
+.admin-pending-review .exam-paper-scroll {
+  background: linear-gradient(180deg, rgb(248 250 252) 0%, rgb(241 245 249) 100%);
+}
