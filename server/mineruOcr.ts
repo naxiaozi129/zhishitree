@@ -58,6 +58,7 @@ export function isMineruOcrEnabled(): boolean {
 
 function extensionForMime(mimeType: string): string {
   const m = mimeType.toLowerCase();
+  if (m.includes('pdf')) return 'pdf';
   if (m.includes('png')) return 'png';
   if (m.includes('webp')) return 'webp';
   if (m.includes('gif')) return 'gif';
@@ -561,5 +562,6 @@ export async function checkMineruHealthDetailed(opts?: MineruHealthOptions): Pro
 
 /** 健康检查（布尔，兼容旧调用） */
 export async function checkMineruHealth(opts?: MineruHealthOptions): Promise<boolean> {
-  return checkMineruHealthDetailed(opts).ok;
+  const result = await checkMineruHealthDetailed(opts);
+  return result.ok;
 }

@@ -473,14 +473,24 @@ button.knowledge-map-node {
 
 .oj-tree-wrap {
   position: relative;
-  min-height: 640px;
-  height: min(72vh, 720px);
+  min-height: calc(100vh - 200px);
+  height: calc(100vh - 200px);
+  max-height: 1080px;
   width: 100%;
   cursor: grab;
   border-radius: 10px;
   overflow: hidden;
   border: 1px solid rgb(226 232 240 / 0.8);
   background: #fff;
+  touch-action: none;
+  overscroll-behavior: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.oj-tree-wrap * {
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .oj-tree-wrap:active {
@@ -617,6 +627,9 @@ button.knowledge-map-node {
   margin: 1rem auto;
   max-width: 100%;
   text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
 }
 
 .exam-paper-figure-img {
@@ -626,6 +639,7 @@ button.knowledge-map-node {
   border: 1px solid rgb(226 232 240);
   background: #fff;
   box-shadow: 0 1px 3px rgb(15 23 42 / 0.06);
+  object-fit: contain;
 }
 
 .exam-paper-figure-cap {
@@ -636,4 +650,39 @@ button.knowledge-map-node {
 
 .admin-pending-review .exam-paper-scroll {
   background: linear-gradient(180deg, rgb(248 250 252) 0%, rgb(241 245 249) 100%);
+}
+
+/* 错题分析内嵌试卷式 OCR */
+.exam-paper-sheet.exam-paper-sheet--embedded {
+  max-width: none;
+  width: 100%;
+  margin: 0;
+  padding: 0.25rem 0;
+  border: none;
+  box-shadow: none;
+  background: transparent;
+  font-size: 14px;
+}
+
+/* 错题录入 — 识别结果预览区约束配图，避免撑破布局 */
+.recognized-exam-preview {
+  min-width: 0;
+  width: 100%;
+}
+
+.recognized-exam-scroll {
+  min-width: 0;
+}
+
+.recognized-exam-scroll .exam-paper-figure,
+.recognized-exam-scroll .exam-paper-figure-img {
+  max-height: none;
+  width: auto;
+  max-width: 100%;
+}
+
+.recognized-exam-scroll .exam-paper-sheet {
+  max-width: none;
+  margin: 0;
+  width: 100%;
 }

@@ -35,6 +35,57 @@ function clampLabel(label: string, max = 16): string {
   return label.length > max ? `${label.slice(0, max)}…` : label;
 }
 
+type ViewTransform = { x: number; y: number; k: number };
+
+function fitCenterTransform(
+  nodes: OjPlacedNode[],
+  toSvg: (n: OjPlacedNode) => { x: number; y: number },
+  viewport: { w: number; h: number },
+  padding = 40,
+): ViewTransform {
+  if (!nodes.length) {
+    return { x: viewport.w / 2, y: viewport.h / 2, k: 0.9 };
+  }
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (const n of nodes) {
+    const p = toSvg(n);
+    minX = Math.min(minX, p.x - OJ_NODE_W / 2);
+    maxX = Math.max(maxX, p.x + OJ_NODE_W / 2);
+    minY = Math.min(minY, p.y - OJ_NODE_H / 2);
+    maxY = Math.max(maxY, p.y + OJ_NODE_H / 2);
+  }
+  const bw = Math.max(maxX - minX, OJ_NODE_W);
+  const bh = Math.max(maxY - minY, OJ_NODE_H);
+  const cx = (minX + maxX) / 2;
+  const cy = (minY + maxY) / 2;
+  const k = Math.min((viewport.w - padding * 2) / bw, (viewport.h - padding * 2) / bh, 1.2);
+  const clampedK = Math.max(0.15, Math.min(3, k));
+  return {
+    k: clampedK,
+    x: viewport.w / 2 - cx * clampedK,
+    y: viewport.h / 2 - cy * clampedK,
+  };
+}
+
+function zoomAtPointer(
+  t: ViewTransform,
+  mx: number,
+  my: number,
+  factor: number,
+): ViewTransform {
+  const newK = Math.max(0.15, Math.min(3, t.k * factor));
+  const contentX = (mx - t.x) / t.k;
+  const contentY = (my - t.y) / t.k;
+  return {
+    k: newK,
+    x: mx - contentX * newK,
+    y: my - contentY * newK,
+  };
+}
+
 export type OjStyleKnowledgeTreeCanvasProps = {
   tree: JuniorScienceTreeNode[];
   displayMastery: Record<string, number>;
@@ -61,8 +112,10 @@ export function OjStyleKnowledgeTreeCanvas({
   caption,
 }: OjStyleKnowledgeTreeCanvasProps) {
   const wrapRef = useRef<HTMLDivElement>(null);
-  const [viewport, setViewport] = useState({ w: 960, h: 640 });
-  const [transform, setTransform] = useState({ x: 0, y: 0, k: 0.85 });
+  const userAdjustedRef = useRef(false);
+  const transformRef = useRef<ViewTransform>({ x: 0, y: 0, k: 0.9 });
+  const [viewport, setViewport] = useState({ w: 960, h: 720 });
+  const [transform, setTransform] = useState<ViewTransform>({ x: 0, y: 0, k: 0.9 });
   const [search, setSearch] = useState('');
   const [searchHits, setSearchHits] = useState<{ id: string; label: string; path: string }[]>([]);
   const dragRef = useRef<{ px: number; py: number; tx: number; ty: number } | null>(null);
@@ -96,48 +149,75 @@ export function OjStyleKnowledgeTreeCanvas({
     [contentOffset],
   );
 
+  const applyTransform = useCallback((next: ViewTransform) => {
+    transformRef.current = next;
+    setTransform(next);
+  }, []);
+
+  const centerContent = useCallback(
+    (markUserAdjusted = false) => {
+      const next = fitCenterTransform(layout.nodes, toSvg, viewport);
+      applyTransform(next);
+      if (markUserAdjusted) userAdjustedRef.current = true;
+    },
+    [layout.nodes, toSvg, viewport, applyTransform],
+  );
+
+  useEffect(() => {
+    transformRef.current = transform;
+  }, [transform]);
+
   useEffect(() => {
     const el = wrapRef.current;
     if (!el) return;
     const ro = new ResizeObserver(() => {
-      setViewport({ w: Math.max(320, el.clientWidth), h: Math.max(420, el.clientHeight || 640) });
+      setViewport({ w: Math.max(320, el.clientWidth), h: Math.max(480, el.clientHeight || 720) });
     });
     ro.observe(el);
-    setViewport({ w: Math.max(320, el.clientWidth), h: Math.max(420, el.clientHeight || 640) });
+    setViewport({ w: Math.max(320, el.clientWidth), h: Math.max(480, el.clientHeight || 720) });
     return () => ro.disconnect();
   }, []);
 
+  /** 初次加载：将知识树居中并适配画布；用户操作后不再自动重置 */
   useEffect(() => {
-    setTransform((t) => ({
-      ...t,
-      x: viewport.w / 2,
-      y: viewport.h - 80,
-    }));
-  }, [viewport.w, viewport.h, layout.width]);
+    if (userAdjustedRef.current || !layout.nodes.length) return;
+    centerContent();
+  }, [layout.nodes.length, viewport.w, viewport.h, centerContent]);
 
-  const onWheel = (e: React.WheelEvent) => {
-    e.preventDefault();
-    const factor = e.deltaY > 0 ? 0.92 : 1.08;
-    setTransform((t) => ({
-      ...t,
-      k: Math.max(0.15, Math.min(2.5, t.k * factor)),
-    }));
-  };
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      userAdjustedRef.current = true;
+      const rect = el.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      const factor = e.deltaY > 0 ? 0.9 : 1.1;
+      applyTransform(zoomAtPointer(transformRef.current, mx, my, factor));
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, [applyTransform]);
 
   const onPointerDown = (e: React.PointerEvent) => {
     if ((e.target as HTMLElement).closest('.oj-tree-node-group')) return;
+    e.preventDefault();
+    window.getSelection()?.removeAllRanges();
     dragRef.current = { px: e.clientX, py: e.clientY, tx: transform.x, ty: transform.y };
+    userAdjustedRef.current = true;
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
   };
 
   const onPointerMove = (e: React.PointerEvent) => {
     const d = dragRef.current;
     if (!d) return;
-    setTransform((t) => ({
-      ...t,
+    applyTransform({
+      ...transformRef.current,
       x: d.tx + (e.clientX - d.px),
       y: d.ty + (e.clientY - d.py),
-    }));
+    });
   };
 
   const onPointerUp = () => {
@@ -205,15 +285,24 @@ export function OjStyleKnowledgeTreeCanvas({
           <span><i className="dot lit" />≥85</span>
           <span className="oj-tree-zoom-tip">
             <ZoomIn size={14} />
-            滚轮缩放 · 拖拽平移
+            滚轮以鼠标为中心缩放 · 拖拽平移
           </span>
+          <button
+            type="button"
+            className="rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-medium text-slate-600 hover:bg-slate-50"
+            onClick={() => {
+              userAdjustedRef.current = false;
+              centerContent();
+            }}
+          >
+            居中
+          </button>
         </div>
       </div>
 
       <div
         ref={wrapRef}
-        className="oj-tree-wrap"
-        onWheel={onWheel}
+        className="oj-tree-wrap select-none"
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}

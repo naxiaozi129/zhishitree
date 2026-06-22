@@ -19,40 +19,31 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import * as htmlToImage from 'html-to-image';
-import { analyzeQuestionImage, explainKnowledgePoint, QuestionAnalysis, KnowledgePointDetails, resolveAnalysisImageUri, resolveCircuitImageUri, figureDataUri } from './services/geminiService';
+import { analyzeRecognizedQuestion, explainKnowledgePoint, QuestionAnalysis, KnowledgePointDetails, resolveAnalysisImageUri, resolveCircuitImageUri, figureDataUriIfValid, isValidFigureData, recognizeQuestionImage, fetchExamServiceHealth, type OcrEngine, type ExamServiceHealth, type QuestionRecognitionResult } from './services/geminiService';
+import { EditableRecognizedExamText } from './components/EditableRecognizedExamText';
+import { EditableOriginalAnswer } from './components/EditableOriginalAnswer';
+import { formatMcqOptionsPerLine } from './utils/formatExamDisplay';
 import { MarkdownRenderer } from './components/MarkdownRenderer';
+import { QuestionSourceMedia } from './components/QuestionSourceMedia';
+import {
+  QUESTION_UPLOAD_ACCEPT,
+  isPdfMime,
+  processQuestionUploadFile,
+} from './utils/uploadQuestionMedia';
 import { useAuth } from './context/AuthContext';
 import { canUseApp } from './utils/roles';
 import { isStaff } from './utils/roles';
 import {
   apiFetch,
+  fetchMistakeDetail,
   saveMistakeIfAuthed,
+  updateMistakeIfAuthed,
   type ReflectionAnalyzeResponse,
   type ReflectionAssessResponse,
 } from './services/api';
+import { restoreMistakeSession } from './components/mistakeDisplay';
 
 const KNOWLEDGE_TREE_VERSION = 'junior-science-v1';
-
-/**
- * 选择题选项常见挤在一行：「A. … B. …」或「A.…B.…」。
- * 在选项字母（A–H）及后的 .、． 前插入换行，使每项独占一行。
- */
-function formatMcqOptionsPerLine(text: string): string {
-  let s = text.replace(/\r\n/g, '\n');
-  if (!s.trim()) return s;
-
-  // 无空格紧挨：A.xxxB.yyy
-  s = s.replace(/([A-Ha-h][.．、][^\n]*?)(?=[A-Ha-h][.．、])/g, '$1\n');
-  // 有空格分隔的下一选项：... xxx B. yyy
-  s = s.replace(/([^\n])\s+([A-Ha-h][.．、]\s)/g, '$1\n$2');
-  // (A) (B) 分行
-  s = s.replace(/([^\n])\s*([（(]\s*[A-Ha-h]\s*[）)])/g, '$1\n$2');
-  // 全角选项号 Ａ．Ｂ．（部分 OCR）
-  s = s.replace(/([Ａ-Ｈ][．、][^\n]*?)(?=[Ａ-Ｈ][．、])/g, '$1\n');
-  s = s.replace(/([^\n])\s+([Ａ-Ｈ][．、]\s)/g, '$1\n$2');
-
-  return s.replace(/\n{3,}/g, '\n\n').trimEnd();
-}
 
 /** 将模型返回的长段文字拆成多条要点，便于分条展示 */
 function splitIntoKeyPoints(text: string): string[] {
@@ -84,37 +75,95 @@ function prepareOcrMarkdown(
 ): string {
   let md = formatMcqOptionsPerLine(content);
   const circuitUri = resolveCircuitImageUri(analysis, fallbackImage);
-  const anyUri = circuitUri ?? resolveAnalysisImageUri(analysis, fallbackImage);
-  if (anyUri) {
-    md = md.replace(/!\[([^\]]*)\]\(fig-(?:circuit|main)\)/g, `![$1](${anyUri})`);
-    md = md.replace(/\[电路图见原题配图\]/g, `![电路图](${anyUri})`);
-    // 修复 Markdown 中无效的相对路径配图
-    md = md.replace(/!\[([^\]]*)\]\((?!data:|https?:)([^)]+)\)/g, (full, alt) => {
-      if (/^fig-/.test(alt)) return full;
-      return `![${alt || '电路图'}](${anyUri})`;
+  const fullUri = resolveAnalysisImageUri(analysis, fallbackImage);
+  const fallbackUri = circuitUri ?? fullUri;
+
+  if (fallbackUri) {
+    md = md.replace(
+      /!\[([^\]]*)\]\(fig-circuit\)/g,
+      (_full, alt) => `![${alt || '电路图'}](${circuitUri ?? fallbackUri})`,
+    );
+    md = md.replace(
+      /!\[([^\]]*)\]\(fig-main\)/g,
+      (_full, alt) => `![${alt || '原题配图'}](${fullUri ?? fallbackUri})`,
+    );
+    md = md.replace(/\[电路图见原题配图\]/g, `![电路图](${circuitUri ?? fallbackUri})`);
+    // MinerU 相对路径或未嵌入的配图引用
+    md = md.replace(/!\[([^\]]*)\]\((?!data:|https?:|fig-)([^)]+)\)/g, (_full, alt) => {
+      return `![${alt || '配图'}](${circuitUri ?? fallbackUri})`;
+    });
+    // 修复 localStorage 截断或空 base64 导致的裂图
+    md = md.replace(/!\[([^\]]*)\]\(data:[^)]*\)/g, (full, alt) => {
+      const m = full.match(/base64,([^)]+)/);
+      if (!m || m[1].trim().length < 64) return `![${alt || '配图'}](${fallbackUri})`;
+      return full;
     });
   }
-  return md;
+  return md.trim();
+}
+
+/** 写入 localStorage 时去掉大图二进制，避免配额溢出与 JSON 截断 */
+function slimAnalysisForStorage(analysis: QuestionAnalysis): QuestionAnalysis {
+  const rawOcrText = analysis.rawOcrText.replace(
+    /!\[([^\]]*)\]\(data:[^)]+\)/g,
+    '![$1](fig-circuit)',
+  );
+  return {
+    ...analysis,
+    rawOcrText,
+    sourceImage: analysis.sourceImage
+      ? { mime: analysis.sourceImage.mime, data: '' }
+      : undefined,
+    figures: analysis.figures?.map((f) => ({ ...f, data: '' })),
+  };
+}
+
+/** 同步云端时保留原题截图（localStorage 会剥离 base64） */
+function analysisForCloudSave(
+  analysis: QuestionAnalysis,
+  image: string | null,
+  mimeType: string,
+): QuestionAnalysis {
+  if (isValidFigureData(analysis.sourceImage?.data)) return analysis;
+  const base64 = image?.includes(',') ? image.split(',')[1] : image;
+  if (!isValidFigureData(base64)) return analysis;
+  return {
+    ...analysis,
+    sourceImage: { mime: mimeType || 'image/jpeg', data: base64! },
+  };
 }
 
 export function ZhishitreeMain({
+  mistakeId,
+  returnTo = 'home',
   onNavigate,
   onBack,
 }: {
-  onNavigate: (path: string) => void;
+  mistakeId?: number;
+  returnTo?: 'home' | 'records';
+  onNavigate: (path: string, query?: Record<string, string | number>) => void;
   onBack: () => void;
 }) {
   const { user } = useAuth();
+  const skipLocalRestore = Boolean(mistakeId);
   const [image, setImage] = useState<string | null>(() => {
+    if (skipLocalRestore) return null;
     const saved = localStorage.getItem('app_image');
     return saved || null;
   });
   const [mimeType, setMimeType] = useState<string>(() => {
+    if (skipLocalRestore) return '';
     const saved = localStorage.getItem('app_mimeType');
     return saved || '';
   });
+  const [uploadFileName, setUploadFileName] = useState<string | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [isRecognizing, setIsRecognizing] = useState(false);
+  const [recognitionResult, setRecognitionResult] = useState<QuestionRecognitionResult | null>(null);
+  const [mistakeRestoring, setMistakeRestoring] = useState(Boolean(mistakeId));
+  const [viewingMistakeId, setViewingMistakeId] = useState<number | null>(mistakeId ?? null);
   const [analysis, setAnalysis] = useState<QuestionAnalysis | null>(() => {
+    if (skipLocalRestore) return null;
     const treeVersion = localStorage.getItem('app_knowledge_tree_version');
     if (treeVersion !== KNOWLEDGE_TREE_VERSION) {
       localStorage.removeItem('app_analysis');
@@ -142,6 +191,12 @@ export function ZhishitreeMain({
   const [reflectionAssessResult, setReflectionAssessResult] = useState<ReflectionAssessResponse | null>(null);
   const [cloudSaveHint, setCloudSaveHint] = useState<string | null>(null);
   const [cloudSaveBusy, setCloudSaveBusy] = useState(false);
+  const [ocrEditSaving, setOcrEditSaving] = useState(false);
+  const [ocrEngine, setOcrEngine] = useState<OcrEngine>(() => {
+    const saved = localStorage.getItem('zhishitree_ocr_engine');
+    return saved === 'exam-service' ? 'exam-service' : 'default';
+  });
+  const [examServiceHealth, setExamServiceHealth] = useState<ExamServiceHealth | null>(null);
 
   type FontScale = 'sm' | 'md' | 'lg';
   const [fontScale, setFontScale] = useState<FontScale>(() => {
@@ -153,9 +208,16 @@ export function ZhishitreeMain({
 
   // Save state to localStorage whenever it changes
   useEffect(() => {
-    if (image) localStorage.setItem('app_image', image);
-    else localStorage.removeItem('app_image');
-  }, [image]);
+    if (!image || isPdfMime(mimeType)) {
+      localStorage.removeItem('app_image');
+      return;
+    }
+    try {
+      localStorage.setItem('app_image', image);
+    } catch {
+      /* localStorage 配额不足时跳过 */
+    }
+  }, [image, mimeType]);
 
   useEffect(() => {
     if (mimeType) localStorage.setItem('app_mimeType', mimeType);
@@ -163,13 +225,98 @@ export function ZhishitreeMain({
   }, [mimeType]);
 
   useEffect(() => {
-    if (analysis) localStorage.setItem('app_analysis', JSON.stringify(analysis));
-    else localStorage.removeItem('app_analysis');
+    if (analysis) {
+      try {
+        localStorage.setItem('app_analysis', JSON.stringify(slimAnalysisForStorage(analysis)));
+      } catch {
+        /* localStorage 配额不足时跳过，内存中仍保留完整 analysis */
+      }
+    } else localStorage.removeItem('app_analysis');
   }, [analysis]);
 
   useEffect(() => {
     localStorage.setItem('zhishitree_ui_font', fontScale);
   }, [fontScale]);
+
+  useEffect(() => {
+    localStorage.setItem('zhishitree_ocr_engine', ocrEngine);
+  }, [ocrEngine]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetchExamServiceHealth().then((h) => {
+      if (cancelled) return;
+      setExamServiceHealth(h);
+      if (h.ok && !localStorage.getItem('zhishitree_ocr_engine')) {
+        setOcrEngine('exam-service');
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!mistakeId) {
+      setMistakeRestoring(false);
+      setViewingMistakeId(null);
+      return;
+    }
+    if (!user) {
+      setMistakeRestoring(false);
+      setError('请先登录后从错题本打开记录');
+      return;
+    }
+
+    let cancelled = false;
+    setMistakeRestoring(true);
+    setError(null);
+
+    (async () => {
+      try {
+        const row = await fetchMistakeDetail(mistakeId);
+        if (cancelled) return;
+        const restored = restoreMistakeSession(row);
+        if (!restored) {
+          setError('错题数据损坏，无法恢复解析');
+          setMistakeRestoring(false);
+          return;
+        }
+        setAnalysis(restored.analysis);
+        setRecognitionResult({
+          rawOcrText: restored.analysis.rawOcrText,
+          originalAnswer: restored.analysis.originalAnswer,
+          correctedAnswer: restored.analysis.correctedAnswer,
+          circuitDescription: restored.analysis.circuitDescription,
+          figures: restored.analysis.figures,
+          ocrMeta: restored.analysis.ocrMeta,
+        });
+        setImage(restored.image);
+        setMimeType(restored.mimeType);
+        setReflectionMistakeId(restored.mistakeId);
+        setStudentReflection(restored.studentReflection);
+        setReflectionAnalyzeResult(restored.reflectionAnalyzeResult);
+        setFollowUpAnswers(restored.followUpAnswers);
+        setSimilarAnswers(restored.similarAnswers);
+        setReflectionAssessResult(restored.reflectionAssessResult);
+        setSelectedPoint(null);
+        setPointDetails(null);
+        setCloudSaveHint(null);
+        setViewingMistakeId(restored.mistakeId);
+        localStorage.setItem('app_knowledge_tree_version', KNOWLEDGE_TREE_VERSION);
+        setMistakeRestoring(false);
+      } catch (e: unknown) {
+        if (!cancelled) {
+          setError(e instanceof Error ? e.message : '加载错题失败');
+          setMistakeRestoring(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [mistakeId, user]);
 
   const resetReflectionLocal = useCallback(() => {
     setReflectionMistakeId(null);
@@ -180,19 +327,26 @@ export function ZhishitreeMain({
     setSimilarAnswers([]);
   }, []);
 
+  const clearMistakeRoute = useCallback(() => {
+    if (mistakeId) onNavigate('entry');
+  }, [mistakeId, onNavigate]);
+
   const clearProgress = () => {
     if (window.confirm('确定要清除当前进度并重新开始吗？')) {
       setImage(null);
       setMimeType('');
       setAnalysis(null);
+      setRecognitionResult(null);
       setSelectedPoint(null);
       setPointDetails(null);
       setError(null);
       resetReflectionLocal();
+      setViewingMistakeId(null);
       localStorage.removeItem('app_image');
       localStorage.removeItem('app_mimeType');
       localStorage.removeItem('app_analysis');
       localStorage.setItem('app_knowledge_tree_version', KNOWLEDGE_TREE_VERSION);
+      clearMistakeRoute();
     }
   };
 
@@ -200,79 +354,79 @@ export function ZhishitreeMain({
   const analysisRef = useRef<HTMLDivElement>(null);
   const uiDetailsRef = useRef<HTMLDetailsElement>(null);
 
-  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    e.target.value = '';
 
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      const img = new window.Image();
-      img.onload = () => {
-        const canvas = document.createElement('canvas');
-        let width = img.width;
-        let height = img.height;
-        const maxDim = 1920;
-
-        if (width > maxDim || height > maxDim) {
-          if (width > height) {
-            height = Math.round((height * maxDim) / width);
-            width = maxDim;
-          } else {
-            width = Math.round((width * maxDim) / height);
-            height = maxDim;
-          }
-        }
-
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          ctx.drawImage(img, 0, 0, width, height);
-          // Compress image more aggressively to reduce base64 size
-          const resizedBase64 = canvas.toDataURL('image/jpeg', 0.92);
-          setImage(resizedBase64);
-          setMimeType('image/jpeg');
-          setAnalysis(null);
-          setError(null);
-          setSelectedPoint(null);
-          setPointDetails(null);
-          resetReflectionLocal();
-          localStorage.setItem('app_knowledge_tree_version', KNOWLEDGE_TREE_VERSION);
-        }
-      };
-      img.src = reader.result as string;
-    };
-    reader.readAsDataURL(file);
+    try {
+      const processed = await processQuestionUploadFile(file);
+      setImage(processed.dataUrl);
+      setMimeType(processed.mimeType);
+      setUploadFileName(processed.fileName);
+      setAnalysis(null);
+      setRecognitionResult(null);
+      setError(null);
+      setSelectedPoint(null);
+      setPointDetails(null);
+      resetReflectionLocal();
+      setViewingMistakeId(null);
+      clearMistakeRoute();
+      localStorage.setItem('app_knowledge_tree_version', KNOWLEDGE_TREE_VERSION);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '文件处理失败');
+    }
   };
 
-  const handleAnalyze = async () => {
-    if (!image) return;
-    
+  const handleRecognize = async () => {
+    if (!image || analysis) return;
+    setIsRecognizing(true);
+    setError(null);
+    setCloudSaveHint(null);
+    setRecognitionResult(null);
+    resetReflectionLocal();
+    try {
+      const base64Data = image.split(',')[1];
+      const recognition = await recognizeQuestionImage(base64Data, mimeType, ocrEngine);
+      setRecognitionResult(recognition);
+    } catch (err: unknown) {
+      console.error(err);
+      setError(`识别失败，请重试。${err instanceof Error ? err.message : '未知网络错误'}`);
+    } finally {
+      setIsRecognizing(false);
+    }
+  };
+
+  const handleAnalyzeKnowledge = async () => {
+    if (!image || !recognitionResult || analysis) return;
     setIsAnalyzing(true);
     setError(null);
     setCloudSaveHint(null);
-    
     try {
-      // Extract base64 data without the data:image/jpeg;base64, prefix
       const base64Data = image.split(',')[1];
-      const result = await analyzeQuestionImage(base64Data, mimeType);
+      const result = await analyzeRecognizedQuestion(
+        recognitionResult.rawOcrText,
+        base64Data,
+        mimeType,
+        recognitionResult,
+      );
       setAnalysis(result);
       setStudentReflection('');
       setReflectionAnalyzeResult(null);
       setReflectionAssessResult(null);
       setFollowUpAnswers([]);
       setSimilarAnswers([]);
-      const saved = await saveMistakeIfAuthed(result);
+      const saved = await saveMistakeIfAuthed(analysisForCloudSave(result, image, mimeType));
       if (saved.ok) {
         setReflectionMistakeId(saved.id);
         setCloudSaveHint(null);
       } else {
         setReflectionMistakeId(null);
-        setCloudSaveHint(saved.message);
+        setCloudSaveHint(saved.ok === false ? saved.message : '同步云端失败');
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error(err);
-      setError(`分析失败，请重试。错误信息: ${err?.message || '未知网络错误'}`);
+      setError(`考点分析失败，请重试。${err instanceof Error ? err.message : '未知网络错误'}`);
     } finally {
       setIsAnalyzing(false);
     }
@@ -329,19 +483,105 @@ export function ZhishitreeMain({
     }
   };
 
+  const persistAnalysisToCloud = async (payload: QuestionAnalysis): Promise<boolean> => {
+    const existingId = reflectionMistakeId ?? viewingMistakeId;
+    if (existingId) {
+      const updated = await updateMistakeIfAuthed(existingId, payload);
+      if (updated.ok) {
+        setReflectionMistakeId(existingId);
+        setCloudSaveHint(null);
+        return true;
+      }
+      setCloudSaveHint(updated.ok === false ? updated.message : '更新失败');
+      return false;
+    }
+    const saved = await saveMistakeIfAuthed(payload);
+    if (saved.ok) {
+      setReflectionMistakeId(saved.id);
+      setCloudSaveHint(null);
+      return true;
+    }
+    setCloudSaveHint(saved.ok === false ? saved.message : '保存失败');
+    return false;
+  };
+
   const retryCloudSave = async () => {
     if (!analysis) return;
     setCloudSaveBusy(true);
     setCloudSaveHint(null);
     try {
-      const saved = await saveMistakeIfAuthed(analysis);
-      if (saved.ok) {
-        setReflectionMistakeId(saved.id);
-      } else {
-        setCloudSaveHint(saved.message);
-      }
+      await persistAnalysisToCloud(analysisForCloudSave(analysis, image, mimeType));
     } finally {
       setCloudSaveBusy(false);
+    }
+  };
+
+  const handleCorrectedAnswerSave = async (nextAnswer: string) => {
+    const trimmed = nextAnswer.trim();
+    if (analysis) {
+      const nextAnalysis: QuestionAnalysis = { ...analysis, correctedAnswer: trimmed || undefined };
+      setAnalysis(nextAnalysis);
+      setRecognitionResult((prev) => (prev ? { ...prev, correctedAnswer: trimmed || undefined } : prev));
+      if (!user || !canUseApp(user)) return;
+      setOcrEditSaving(true);
+      try {
+        const ok = await persistAnalysisToCloud(analysisForCloudSave(nextAnalysis, image, mimeType));
+        if (!ok) {
+          setError('批改答案已更新，但同步云端失败，可点击「重试同步到云端错题本」。');
+        }
+      } finally {
+        setOcrEditSaving(false);
+      }
+      return;
+    }
+    if (recognitionResult) {
+      setRecognitionResult({ ...recognitionResult, correctedAnswer: trimmed || undefined });
+    }
+  };
+
+  const handleOriginalAnswerSave = async (nextAnswer: string) => {
+    const trimmed = nextAnswer.trim();
+    if (analysis) {
+      const nextAnalysis: QuestionAnalysis = { ...analysis, originalAnswer: trimmed || undefined };
+      setAnalysis(nextAnalysis);
+      setRecognitionResult((prev) => (prev ? { ...prev, originalAnswer: trimmed || undefined } : prev));
+      if (!user || !canUseApp(user)) return;
+      setOcrEditSaving(true);
+      try {
+        const ok = await persistAnalysisToCloud(analysisForCloudSave(nextAnalysis, image, mimeType));
+        if (!ok) {
+          setError('手写答案已更新，但同步云端失败，可点击「重试同步到云端错题本」。');
+        }
+      } finally {
+        setOcrEditSaving(false);
+      }
+      return;
+    }
+    if (recognitionResult) {
+      setRecognitionResult({ ...recognitionResult, originalAnswer: trimmed || undefined });
+    }
+  };
+
+  const handleOcrTextSave = async (nextRaw: string) => {
+    const formatted = formatMcqOptionsPerLine(nextRaw);
+    if (analysis) {
+      const nextAnalysis: QuestionAnalysis = { ...analysis, rawOcrText: formatted };
+      setAnalysis(nextAnalysis);
+      setRecognitionResult((prev) => (prev ? { ...prev, rawOcrText: formatted } : prev));
+      if (!user || !canUseApp(user)) return;
+      setOcrEditSaving(true);
+      try {
+        const ok = await persistAnalysisToCloud(analysisForCloudSave(nextAnalysis, image, mimeType));
+        if (!ok) {
+          setError('识别文本已更新，但同步云端失败，可点击「重试同步到云端错题本」。');
+        }
+      } finally {
+        setOcrEditSaving(false);
+      }
+      return;
+    }
+    if (recognitionResult) {
+      setRecognitionResult({ ...recognitionResult, rawOcrText: formatted });
     }
   };
 
@@ -410,7 +650,8 @@ export function ZhishitreeMain({
 
     if (analysis.figures?.length) {
       for (const fig of analysis.figures) {
-        md += `![${fig.label}](${figureDataUri(fig)})\n\n`;
+        const uri = figureDataUriIfValid(fig) ?? image;
+        if (uri) md += `![${fig.label}](${uri})\n\n`;
       }
     }
     
@@ -457,19 +698,40 @@ export function ZhishitreeMain({
   };
 
   const fontScaleClass = fontScale === 'sm' ? 'text-sm' : fontScale === 'lg' ? 'text-lg' : 'text-base';
+  const showResultsPanel = Boolean(
+    analysis || isAnalyzing || isRecognizing || recognitionResult || mistakeRestoring,
+  );
+  const compactUploadPanel = Boolean(analysis || (recognitionResult && !analysis));
+  const ocrPreviewAnalysis: QuestionAnalysis | null =
+    analysis ??
+    (recognitionResult
+      ? {
+          rawOcrText: recognitionResult.rawOcrText,
+          knowledgePoints: [],
+          pitfalls: [],
+          knowledgeTree: [],
+          summary: '',
+          specificMistake: '',
+          originalAnswer: recognitionResult.originalAnswer,
+          correctedAnswer: recognitionResult.correctedAnswer,
+          figures: recognitionResult.figures,
+          circuitDescription: recognitionResult.circuitDescription,
+          ocrMeta: recognitionResult.ocrMeta,
+        }
+      : null);
 
   return (
     <div
       className={`min-h-screen bg-gradient-to-b from-slate-50 via-white to-teal-50/30 text-slate-900 font-sans selection:bg-indigo-100 selection:text-indigo-900 ${fontScaleClass}`}
     >
       <header className="sticky top-0 z-20 border-b border-slate-200/90 bg-white/90 shadow-sm shadow-slate-200/50 backdrop-blur-md">
-        <div className="mx-auto flex h-16 max-w-7xl items-center justify-between gap-3 px-4 sm:px-6 lg:px-8">
+        <div className="mx-auto flex h-14 max-w-[1600px] items-center justify-between gap-3 px-4 sm:px-6 lg:px-8 xl:px-10">
           <div className="flex min-w-0 flex-1 items-center gap-2">
             <button
               type="button"
               onClick={onBack}
               className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-600 shadow-sm transition hover:border-emerald-300 hover:bg-emerald-50 hover:text-emerald-800"
-              aria-label="返回首页"
+              aria-label={returnTo === 'records' ? '返回错题本' : '返回首页'}
             >
               <Home size={20} />
             </button>
@@ -478,9 +740,13 @@ export function ZhishitreeMain({
             </div>
             <div className="min-w-0">
               <h1 className="truncate text-base font-bold tracking-tight text-slate-900 sm:text-lg">
-                错题录入
+                {viewingMistakeId ? `错题解析 #${viewingMistakeId}` : '错题录入'}
               </h1>
-              <p className="hidden truncate text-[11px] text-slate-500 sm:block">拍照分析 · 考点归纳 · 思维交流</p>
+              <p className="hidden truncate text-[11px] text-slate-500 sm:block">
+                {viewingMistakeId
+                  ? '已从云端恢复 · 保留原解析与思维交流'
+                  : '拍照分析 · 考点归纳 · 思维交流'}
+              </p>
             </div>
           </div>
           <div className="flex items-center gap-1.5 sm:gap-2 shrink-0 flex-wrap justify-end">
@@ -572,7 +838,7 @@ export function ZhishitreeMain({
 
       {!hasApiKey && (
         <div className="bg-amber-50 border-b border-amber-200 text-amber-950">
-          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3 text-sm flex items-start gap-2">
+          <div className="max-w-[1600px] mx-auto px-4 sm:px-6 lg:px-8 xl:px-10 py-3 text-sm flex items-start gap-2">
             <AlertCircle size={18} className="shrink-0 mt-0.5 text-amber-600" />
             <p>
               尚未配置 <code className="rounded bg-amber-100/80 px-1 py-0.5 text-xs font-mono">GEMINI_API_KEY</code>
@@ -584,41 +850,55 @@ export function ZhishitreeMain({
         </div>
       )}
 
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+      <main className="max-w-[1600px] mx-auto px-4 sm:px-6 lg:px-8 xl:px-10 py-5">
+        <div className={`grid gap-5 items-start ${showResultsPanel ? 'lg:grid-cols-12' : 'grid-cols-1 max-w-2xl mx-auto'}`}>
           
           {/* Left Column: Upload & Preview */}
-          <div className="lg:col-span-5 space-y-6">
-            <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
-              <div className="p-6 border-b border-slate-100 bg-slate-50/50">
-                <h2 className="text-lg font-semibold flex items-center gap-2">
-                  <ImageIcon size={20} className="text-indigo-500" />
+          <div className={`space-y-4 min-w-0 ${showResultsPanel ? 'lg:col-span-3 lg:sticky lg:top-[4.5rem] lg:self-start' : ''}`}>
+            <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+              <div className={`border-b border-slate-100 bg-slate-50/50 ${compactUploadPanel ? 'px-4 py-3' : 'p-5'}`}>
+                <h2 className={`font-semibold flex items-center gap-2 ${compactUploadPanel ? 'text-sm' : 'text-lg'}`}>
+                  <ImageIcon size={compactUploadPanel ? 16 : 20} className="text-indigo-500" />
                   上传错题
                 </h2>
               </div>
               
-              <div className="p-6">
+              <div className={compactUploadPanel ? 'p-4' : 'p-6'}>
                 {!image ? (
                   <div 
                     onClick={() => fileInputRef.current?.click()}
-                    className="border-2 border-dashed border-slate-300 rounded-xl p-12 text-center cursor-pointer hover:border-indigo-400 hover:bg-indigo-50/50 transition-colors group"
+                    className={`border-2 border-dashed border-slate-300 rounded-xl text-center cursor-pointer hover:border-indigo-400 hover:bg-indigo-50/50 transition-colors group ${compactUploadPanel ? 'p-6' : 'p-12'}`}
                   >
-                    <div className="bg-slate-100 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-4 group-hover:bg-indigo-100 transition-colors">
-                      <UploadCloud size={28} className="text-slate-500 group-hover:text-indigo-600" />
+                    <div className={`bg-slate-100 rounded-full flex items-center justify-center mx-auto mb-3 group-hover:bg-indigo-100 transition-colors ${analysis ? 'w-12 h-12' : 'w-16 h-16 mb-4'}`}>
+                      <UploadCloud size={analysis ? 22 : 28} className="text-slate-500 group-hover:text-indigo-600" />
                     </div>
-                    <p className="text-slate-600 font-medium mb-1">点击或拖拽上传错题照片</p>
-                    <p className="text-slate-400 text-sm">支持 JPG, PNG 格式</p>
+                    <p className={`text-slate-600 font-medium ${analysis ? 'text-sm mb-0.5' : 'mb-1'}`}>
+                      点击或拖拽上传错题
+                    </p>
+                    {!analysis && <p className="text-slate-400 text-sm">支持 JPG、PNG、PDF（扫描版请用 exam 识别）</p>}
                   </div>
                 ) : (
-                  <div className="space-y-4">
-                    <div className="relative rounded-xl overflow-hidden border border-slate-200 bg-slate-100 aspect-auto max-h-[400px] flex items-center justify-center">
-                      <img src={image} alt="Uploaded question" className="max-w-full max-h-[400px] object-contain" />
+                  <div className="space-y-3">
+                    <div className={`relative rounded-lg overflow-hidden border border-slate-200 bg-slate-100 w-full ${compactUploadPanel ? 'max-h-[200px]' : 'max-h-[400px]'}`}>
+                      <QuestionSourceMedia
+                        uri={image}
+                        mime={mimeType}
+                        fileName={uploadFileName}
+                        alt="Uploaded question"
+                        className={`w-full max-w-full object-contain ${compactUploadPanel ? 'max-h-[200px]' : 'max-h-[400px]'}`}
+                        embedClassName={`w-full rounded-md bg-white border-0 ${compactUploadPanel ? 'max-h-[200px]' : 'max-h-[360px]'}`}
+                      />
                       <button 
                         onClick={() => {
                           setImage(null);
+                          setUploadFileName(null);
+                          setMimeType('');
                           setAnalysis(null);
+                          setRecognitionResult(null);
                           setSelectedPoint(null);
                           resetReflectionLocal();
+                          setViewingMistakeId(null);
+                          clearMistakeRoute();
                         }}
                         className="absolute top-2 right-2 bg-white/90 backdrop-blur-sm p-1.5 rounded-full text-slate-600 hover:text-red-600 hover:bg-white transition-colors shadow-sm"
                       >
@@ -626,31 +906,139 @@ export function ZhishitreeMain({
                       </button>
                     </div>
                     
-                    <button
-                      onClick={handleAnalyze}
-                      disabled={isAnalyzing}
-                      className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-3 px-4 rounded-xl transition-colors flex items-center justify-center gap-2 disabled:opacity-70 disabled:cursor-not-allowed shadow-sm shadow-indigo-200"
-                    >
-                      {isAnalyzing ? (
-                        <>
-                          <Loader2 size={20} className="animate-spin" />
-                          正在深度分析中...
-                        </>
-                      ) : (
-                        <>
-                          <BookOpen size={20} />
-                          开始分析错题
-                        </>
-                      )}
-                    </button>
+                    {!analysis && !isAnalyzing && !isRecognizing && !recognitionResult ? (
+                      <div className="rounded-lg border border-slate-200 bg-slate-50/70 p-2.5 space-y-1.5">
+                        <p className="text-[11px] font-medium text-slate-600">识别引擎（环节 ①）</p>
+                        <div className="grid grid-cols-1 gap-1.5">
+                          <label className={`flex items-start gap-2 rounded-md border px-2.5 py-1.5 cursor-pointer transition-colors ${ocrEngine === 'default' ? 'border-indigo-300 bg-indigo-50/60' : 'border-slate-200 bg-white hover:border-slate-300'}`}>
+                            <input
+                              type="radio"
+                              name="ocr-engine"
+                              className="mt-0.5"
+                              checked={ocrEngine === 'default'}
+                              onChange={() => setOcrEngine('default')}
+                            />
+                            <span className="min-w-0">
+                              <span className="block text-xs font-medium text-slate-800">默认（内置 MinerU / 视觉）</span>
+                              <span className="block text-[11px] text-slate-500">应用内置识别链路，无需额外服务</span>
+                            </span>
+                          </label>
+                          <label className={`flex items-start gap-2 rounded-md border px-2.5 py-1.5 cursor-pointer transition-colors ${ocrEngine === 'exam-service' ? 'border-emerald-300 bg-emerald-50/60' : 'border-slate-200 bg-white hover:border-slate-300'}`}>
+                            <input
+                              type="radio"
+                              name="ocr-engine"
+                              className="mt-0.5"
+                              checked={ocrEngine === 'exam-service'}
+                              onChange={() => setOcrEngine('exam-service')}
+                            />
+                            <span className="min-w-0">
+                              <span className="block text-xs font-medium text-slate-800 flex items-center gap-1.5">
+                                exam-paper-recognition 服务
+                                {examServiceHealth ? (
+                                  <span
+                                    className={`inline-block h-1.5 w-1.5 rounded-full ${examServiceHealth.ok ? 'bg-emerald-500' : 'bg-rose-400'}`}
+                                    title={examServiceHealth.message}
+                                  />
+                                ) : null}
+                              </span>
+                              <span className="block text-[11px] text-slate-500">
+                                cloud_precision + 规则后处理 + AI 纠错（需 8080 服务在线）
+                              </span>
+                            </span>
+                          </label>
+                        </div>
+                        {ocrEngine === 'exam-service' && examServiceHealth && !examServiceHealth.ok ? (
+                          <p className="text-[11px] text-rose-600 leading-relaxed">
+                            {examServiceHealth.message}
+                            {examServiceHealth.detail ? `（${examServiceHealth.detail}）` : ''}；识别失败时会自动回退默认链路。
+                          </p>
+                        ) : null}
+                      </div>
+                    ) : null}
+
+                    <div className="flex items-center gap-1 text-[10px] text-slate-400 px-0.5">
+                      <span className={recognitionResult || analysis ? 'text-emerald-600 font-semibold' : 'font-medium'}>① 试卷识别</span>
+                      <ChevronRight size={10} />
+                      <span className={analysis ? 'text-emerald-600 font-semibold' : ''}>② 核对编辑</span>
+                      <ChevronRight size={10} />
+                      <span className={analysis ? 'text-emerald-600 font-semibold' : ''}>③ 考点分析</span>
+                    </div>
+
+                    {!analysis && !recognitionResult ? (
+                      <button
+                        type="button"
+                        onClick={() => void handleRecognize()}
+                        disabled={isRecognizing || isAnalyzing}
+                        className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-medium rounded-lg transition-colors flex items-center justify-center gap-2 disabled:opacity-70 disabled:cursor-not-allowed shadow-sm shadow-emerald-200 py-3 px-4 rounded-xl"
+                      >
+                        {isRecognizing ? (
+                          <>
+                            <Loader2 size={20} className="animate-spin" />
+                            正在识别题目…
+                          </>
+                        ) : (
+                          <>
+                            <BookOpen size={20} />
+                            ① 识别题目
+                          </>
+                        )}
+                      </button>
+                    ) : null}
+
+                    {recognitionResult && !analysis ? (
+                      <div className="space-y-2">
+                        <button
+                          type="button"
+                          onClick={() => void handleAnalyzeKnowledge()}
+                          disabled={isAnalyzing || isRecognizing}
+                          className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-medium rounded-lg transition-colors flex items-center justify-center gap-2 disabled:opacity-70 disabled:cursor-not-allowed shadow-sm shadow-indigo-200 py-3 px-4 rounded-xl"
+                        >
+                          {isAnalyzing ? (
+                            <>
+                              <Loader2 size={20} className="animate-spin" />
+                              正在分析考点…
+                            </>
+                          ) : (
+                            <>
+                              <Target size={20} />
+                              ③ 开始考点分析
+                            </>
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void handleRecognize()}
+                          disabled={isRecognizing || isAnalyzing}
+                          className="w-full text-sm text-slate-600 hover:text-indigo-700 py-1.5"
+                        >
+                          重新识别
+                        </button>
+                      </div>
+                    ) : null}
+
+                    {analysis ? (
+                      <button
+                        type="button"
+                        disabled
+                        className="w-full bg-indigo-600 text-white font-medium rounded-lg flex items-center justify-center gap-2 opacity-70 cursor-not-allowed shadow-sm py-2 px-3 text-sm"
+                      >
+                        <Check size={20} />
+                        已完成分析
+                      </button>
+                    ) : null}
+                    {viewingMistakeId ? (
+                      <p className="text-xs text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2 leading-relaxed">
+                        已从错题本恢复 #{viewingMistakeId}，保留原解析与思维交流记录，无需重复分析。
+                      </p>
+                    ) : null}
                   </div>
                 )}
                 
                 <input 
                   type="file" 
                   ref={fileInputRef} 
-                  onChange={handleImageUpload} 
-                  accept="image/*" 
+                  onChange={(e) => void handleFileUpload(e)} 
+                  accept={QUESTION_UPLOAD_ACCEPT} 
                   className="hidden" 
                 />
               </div>
@@ -684,48 +1072,123 @@ export function ZhishitreeMain({
           </div>
 
           {/* Right Column: Analysis Results */}
-          <div className="lg:col-span-7 space-y-6">
-            <AnimatePresence mode="wait">
-              {!analysis && !isAnalyzing && (
-                <motion.div 
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -10 }}
-                  className="bg-white rounded-2xl shadow-sm border border-slate-200 p-12 text-center h-full flex flex-col items-center justify-center min-h-[400px]"
+          <div className={`${showResultsPanel ? 'lg:col-span-9' : ''} min-w-0 w-full`}>
+            <div
+              className={`relative w-full ${
+                isRecognizing || (isAnalyzing && !analysis) || (mistakeRestoring && !analysis && !isAnalyzing)
+                  ? 'min-h-[min(360px,45vh)]'
+                  : ''
+              }`}
+            >
+              {(isRecognizing || (isAnalyzing && !analysis)) && (
+                <div
+                  className="absolute inset-0 z-20 flex flex-col items-center justify-center rounded-2xl border border-slate-200 bg-white/95 backdrop-blur-sm p-8 text-center shadow-sm"
+                  aria-busy="true"
                 >
+                  <Loader2
+                    size={40}
+                    className={`animate-spin mb-6 mx-auto ${isRecognizing ? 'text-emerald-500' : 'text-indigo-500'}`}
+                  />
+                  <h3 className="text-xl font-medium text-slate-700 mb-2">
+                    {isRecognizing ? '正在识别题目…' : 'AI 正在分析考点…'}
+                  </h3>
+                  <p className="text-slate-500 text-sm max-w-md">
+                    {isRecognizing
+                      ? ocrEngine === 'exam-service'
+                        ? 'exam-paper-recognition 识别题目正文，并按黑/红笔迹提取手写答案'
+                        : '内置 MinerU / 视觉 OCR 识别题目，并按黑/红笔迹提取手写答案'
+                      : '基于已识别正文，匹配知识库并构建知识网络（不再重复 OCR）'}
+                  </p>
+                </div>
+              )}
+
+              {mistakeRestoring && !analysis && !isAnalyzing && (
+                <div
+                  className="absolute inset-0 z-20 flex flex-col items-center justify-center rounded-2xl border border-slate-200 bg-white/95 backdrop-blur-sm p-8 text-center shadow-sm"
+                  aria-busy="true"
+                >
+                  <Loader2 size={40} className="animate-spin text-emerald-500 mb-6 mx-auto" />
+                  <h3 className="text-xl font-medium text-slate-700 mb-2">正在恢复解析...</h3>
+                  <p className="text-slate-500 text-sm">从云端加载原题、分析结果与思维交流记录</p>
+                </div>
+              )}
+
+              {!showResultsPanel && (
+                <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-12 text-center flex flex-col items-center justify-center min-h-[320px] w-full">
                   <div className="bg-slate-50 w-20 h-20 rounded-full flex items-center justify-center mb-6">
                     <Network size={32} className="text-slate-300" />
                   </div>
-                  <h3 className="text-xl font-medium text-slate-700 mb-2">等待分析</h3>
-                  <p className="text-slate-500 max-w-sm">上传错题照片并点击分析，AI 将为您拆解考察知识点、易错点，并构建知识图谱。</p>
-                </motion.div>
+                  <h3 className="text-xl font-medium text-slate-700 mb-2">等待上传</h3>
+                  <p className="text-slate-500 max-w-sm">上传错题照片或 PDF 后，先识别题目，核对无误再分析考点。</p>
+                </div>
               )}
 
-              {isAnalyzing && (
-                <motion.div 
-                  key="analyzing-loader"
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -10 }}
-                  className="bg-white rounded-2xl shadow-sm border border-slate-200 p-12 text-center h-full flex flex-col items-center justify-center min-h-[400px]"
-                >
-                  <Loader2 size={40} className="animate-spin text-indigo-500 mb-6 mx-auto" />
-                  <h3 className="text-xl font-medium text-slate-700 mb-2">AI 正在思考...</h3>
-                  <p className="text-slate-500">正在提取题目信息、匹配知识库、构建知识网络</p>
-                </motion.div>
+              {!analysis && !isAnalyzing && !isRecognizing && !mistakeRestoring && recognitionResult && ocrPreviewAnalysis && (
+                <div className="w-full bg-white rounded-xl shadow-sm border border-emerald-200 overflow-hidden">
+                  <div className="px-4 py-3 border-b border-emerald-100 bg-emerald-50/40 border-l-4 border-l-emerald-500">
+                    <h2 className="text-lg font-bold text-slate-800">识别结果</h2>
+                    <p className="text-xs text-slate-500 mt-0.5">
+                      环节 ②：核对黑色原始作答与红色批改答案、识别文本，可直接编辑；确认后点击左侧「开始考点分析」
+                    </p>
+                    {ocrPreviewAnalysis.ocrMeta ? (
+                      <p className="mt-1 text-[11px] text-emerald-700">
+                        识别流水线：{ocrPreviewAnalysis.ocrMeta.pipeline}
+                        {ocrPreviewAnalysis.ocrMeta.mineruBackend
+                          ? ` · ${ocrPreviewAnalysis.ocrMeta.mineruBackend}`
+                          : ''}
+                      </p>
+                    ) : null}
+                  </div>
+                  <div className="p-4 min-w-0 space-y-4">
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <EditableOriginalAnswer
+                        kind="original"
+                        value={ocrPreviewAnalysis.originalAnswer || ''}
+                        onSave={handleOriginalAnswerSave}
+                        saving={ocrEditSaving}
+                      />
+                      <EditableOriginalAnswer
+                        kind="corrected"
+                        value={ocrPreviewAnalysis.correctedAnswer || ''}
+                        onSave={handleCorrectedAnswerSave}
+                        saving={ocrEditSaving}
+                      />
+                    </div>
+                    <EditableRecognizedExamText
+                      rawText={ocrPreviewAnalysis.rawOcrText}
+                      previewMarkdown={prepareOcrMarkdown(ocrPreviewAnalysis.rawOcrText, ocrPreviewAnalysis, image)}
+                      onSave={handleOcrTextSave}
+                      saving={ocrEditSaving}
+                      className="recognized-exam-preview min-w-0"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {!analysis && !isAnalyzing && !isRecognizing && !mistakeRestoring && !recognitionResult && image && showResultsPanel && (
+                <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-12 text-center min-h-[280px] flex flex-col items-center justify-center w-full">
+                  <BookOpen size={36} className="text-indigo-300 mb-4" />
+                  <h3 className="text-lg font-medium text-slate-700 mb-2">已上传，等待识别</h3>
+                  <p className="text-slate-500 text-sm max-w-sm">点击左侧「① 识别题目」开始 exam-paper-recognition 试卷识别。</p>
+                </div>
               )}
 
               {analysis && (
-                <motion.div 
-                  key="analysis-result"
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  className="space-y-6"
-                >
-                  <div className="flex flex-col gap-3 sm:flex-row sm:justify-between sm:items-center bg-white p-4 rounded-2xl shadow-sm border border-slate-200">
+                <div className="space-y-4 w-full">
+                  <div className="flex flex-col gap-2 sm:flex-row sm:justify-between sm:items-center bg-white px-4 py-3 rounded-xl shadow-sm border border-slate-200">
                     <div>
-                      <h2 className="text-xl font-bold text-slate-800">分析结果</h2>
-                      <p className="text-sm text-slate-500 mt-0.5">按模块浏览：摘要 → 错因 → 易错点 → 知识网络</p>
+                      <h2 className="text-lg font-bold text-slate-800">分析结果</h2>
+                      <p className="text-xs text-slate-500 mt-0.5">
+                        摘要 · 错因 · 易错点 · 知识网络 并排浏览
+                      </p>
+                      {analysis.ocrMeta ? (
+                        <p className="mt-1 text-[11px] text-emerald-700">
+                          识别流水线：{analysis.ocrMeta.pipeline}
+                          {analysis.ocrMeta.source === 'mineru'
+                            ? ` · MinerU ${analysis.ocrMeta.mineruBackend ?? 'VLM'}`
+                            : ' · 视觉大模型回退（MinerU 未用或不可用）'}
+                        </p>
+                      ) : null}
                     </div>
                     <div className="flex flex-wrap items-center gap-2 sm:gap-3">
                       <button
@@ -746,108 +1209,131 @@ export function ZhishitreeMain({
                     </div>
                   </div>
 
-                  <div ref={analysisRef} className="space-y-8 bg-slate-50 p-4 -mx-4 sm:mx-0 sm:p-0">
-                    {/* ① OCR + 原题配图 */}
+                  <div ref={analysisRef} className="grid gap-4 xl:grid-cols-2 2xl:grid-cols-3">
+                    {/* ① OCR + 原题配图 — 通栏，题图与文字左右分栏 */}
                     {(analysis.rawOcrText || resolveAnalysisImageUri(analysis, image)) && (
-                      <div className="bg-white rounded-2xl shadow-sm border border-slate-200 border-l-[5px] border-l-slate-400 overflow-hidden">
-                        <div className="px-5 pt-5 pb-2 border-b border-slate-100 bg-slate-50/60">
-                          <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">① 题目原文</p>
-                          <h3 className="text-lg font-bold text-slate-900 mt-1 flex items-center gap-2">
-                            <BookOpen size={20} className="text-slate-500 shrink-0" />
+                      <div className="xl:col-span-2 2xl:col-span-3 bg-white rounded-xl shadow-sm border border-slate-200 border-l-[4px] border-l-slate-400 overflow-hidden">
+                        <div className="px-4 py-2.5 border-b border-slate-100 bg-slate-50/60">
+                          <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">① 题目原文</p>
+                          <h3 className="text-base font-bold text-slate-900 mt-0.5 flex items-center gap-2">
+                            <BookOpen size={17} className="text-slate-500 shrink-0" />
                             识别文本 · 表格 · 配图
                           </h3>
-                          <p className="text-sm text-slate-500 mt-1">
-                            表格以 Markdown 渲染；电路图无法纯文字还原时，保留原题截图嵌入题目
-                          </p>
                         </div>
-                        <div className="p-5 space-y-4">
-                          {resolveCircuitImageUri(analysis, image) ? (
-                            <div className="rounded-xl border border-emerald-200 bg-emerald-50/40 p-3">
-                              <p className="text-xs font-medium text-emerald-800 mb-2">电路图 / 题图</p>
+                        <div className="p-4 grid gap-4 lg:grid-cols-[minmax(200px,34%)_1fr] lg:items-start">
+                          <div className="space-y-3">
+                          {(() => {
+                            const circuitFig =
+                              analysis?.figures?.find((f) => f.id === 'fig-circuit') ??
+                              analysis?.figures?.find((f) => /电路/.test(f.label));
+                            const circuitUri = resolveCircuitImageUri(analysis, image);
+                            const fullUri = resolveAnalysisImageUri(analysis, image);
+                            const sourceMime = analysis.sourceImage?.mime || mimeType;
+                            return (
+                              <>
+                                {circuitUri ? (
+                                  <div className="rounded-lg border border-emerald-200 bg-emerald-50/40 p-2">
+                                    <p className="text-[11px] font-medium text-emerald-800 mb-1.5">电路图 / 题图</p>
+                                    <QuestionSourceMedia
+                                      uri={circuitUri}
+                                      mime={circuitFig?.mime}
+                                      alt="电路图"
+                                      className="max-h-[min(280px,40vh)] w-full object-contain rounded-md bg-white"
+                                      embedClassName="w-full max-h-[min(280px,40vh)] rounded-md bg-white"
+                                    />
+                                  </div>
+                                ) : null}
+                                {fullUri && fullUri !== circuitUri ? (
+                                  <div className="rounded-lg border border-slate-200 bg-slate-50/80 p-2">
+                                    <p className="text-[11px] font-medium text-slate-500 mb-1.5">
+                                      {isPdfMime(sourceMime) ? '原题 PDF' : '原题完整截图'}
+                                    </p>
+                                    <QuestionSourceMedia
+                                      uri={fullUri}
+                                      mime={sourceMime}
+                                      fileName={uploadFileName}
+                                      alt="原题"
+                                      className="max-h-[min(220px,35vh)] w-full object-contain rounded-md bg-white"
+                                      embedClassName="w-full max-h-[min(220px,35vh)] rounded-md bg-white"
+                                    />
+                                  </div>
+                                ) : null}
+                              </>
+                            );
+                          })()}
+                          {analysis.figures
+                            ?.filter((fig) => {
+                              if (fig.id === 'fig-circuit') return false;
+                              if (!figureDataUriIfValid(fig)) return false;
+                              const topUri = resolveCircuitImageUri(analysis, image);
+                              const figUri = figureDataUriIfValid(fig);
+                              return !topUri || figUri !== topUri;
+                            })
+                            .map((fig) => (
+                            <div key={fig.id} className="rounded-lg border border-slate-200 bg-white p-2">
+                              <p className="text-[11px] font-medium text-slate-600 mb-1">{fig.label}</p>
                               <img
-                                src={resolveCircuitImageUri(analysis, image)!}
-                                alt="电路图"
-                                className="max-h-[320px] w-full object-contain rounded-lg bg-white"
+                                src={figureDataUriIfValid(fig)!}
+                                alt={fig.label}
+                                className="max-h-48 w-full object-contain rounded-md"
                               />
                             </div>
-                          ) : null}
-                          {resolveAnalysisImageUri(analysis, image) &&
-                          resolveCircuitImageUri(analysis, image) !== resolveAnalysisImageUri(analysis, image) ? (
-                            <div className="rounded-xl border border-slate-200 bg-slate-50/80 p-3">
-                              <p className="text-xs font-medium text-slate-500 mb-2">原题完整截图（对照用）</p>
-                              <img
-                                src={resolveAnalysisImageUri(analysis, image)!}
-                                alt="原题截图"
-                                className="max-h-[280px] w-full object-contain rounded-lg bg-white"
-                              />
-                            </div>
-                          ) : resolveAnalysisImageUri(analysis, image) &&
-                            !resolveCircuitImageUri(analysis, image) ? (
-                            <div className="rounded-xl border border-slate-200 bg-slate-50/80 p-3">
-                              <p className="text-xs font-medium text-slate-500 mb-2">原题截图（含电路图 / 表格）</p>
-                              <img
-                                src={resolveAnalysisImageUri(analysis, image)!}
-                                alt="原题配图"
-                                className="max-h-[420px] w-full object-contain rounded-lg bg-white"
-                              />
-                            </div>
-                          ) : null}
+                          ))}
+                          </div>
+                          <div className="space-y-3 min-h-0 min-w-0">
                           {analysis.circuitDescription?.trim() ? (
-                            <div className="rounded-xl border border-amber-100 bg-amber-50/60 px-4 py-3 text-sm text-amber-950">
+                            <div className="rounded-lg border border-amber-100 bg-amber-50/60 px-3 py-2 text-sm text-amber-950">
                               <span className="font-semibold">电路连接：</span>
                               {analysis.circuitDescription.trim()}
                             </div>
                           ) : null}
+                          <div className="grid gap-3 sm:grid-cols-2">
+                            <EditableOriginalAnswer
+                              kind="original"
+                              value={analysis.originalAnswer || ''}
+                              onSave={handleOriginalAnswerSave}
+                              saving={ocrEditSaving}
+                            />
+                            <EditableOriginalAnswer
+                              kind="corrected"
+                              value={analysis.correctedAnswer || ''}
+                              onSave={handleCorrectedAnswerSave}
+                              saving={ocrEditSaving}
+                            />
+                          </div>
                           {analysis.rawOcrText ? (
-                            <div className="max-h-[520px] overflow-y-auto rounded-xl border border-slate-100 bg-slate-50/80 px-4 py-3">
-                              <MarkdownRenderer
-                                content={prepareOcrMarkdown(analysis.rawOcrText, analysis, image)}
-                                density="relaxed"
-                              />
-                            </div>
+                            <EditableRecognizedExamText
+                              rawText={analysis.rawOcrText}
+                              previewMarkdown={prepareOcrMarkdown(analysis.rawOcrText, analysis, image)}
+                              onSave={handleOcrTextSave}
+                              saving={ocrEditSaving}
+                            />
                           ) : null}
-                          {analysis.figures
-                            ?.filter(
-                              (fig) =>
-                                fig.id !== 'fig-circuit' &&
-                                !analysis.figures?.some((c) => c.id === 'fig-circuit' && c.data === fig.data),
-                            )
-                            .map((fig) => (
-                            <div key={fig.id} className="rounded-xl border border-slate-200 bg-white p-3">
-                              <p className="text-xs font-medium text-slate-600 mb-2">{fig.label}</p>
-                              {fig.note ? <p className="text-xs text-slate-500 mb-2">{fig.note}</p> : null}
-                              <img
-                                src={figureDataUri(fig)}
-                                alt={fig.label}
-                                className="max-h-80 w-full object-contain rounded-lg"
-                              />
-                            </div>
-                          ))}
+                          </div>
                         </div>
                       </div>
                     )}
 
-                  {/* ② 题目摘要 — 分条要点 */}
-                  <div className="bg-white rounded-2xl shadow-sm border border-slate-200 border-l-[5px] border-l-indigo-500 overflow-hidden">
-                    <div className="px-5 pt-5 pb-2 border-b border-slate-100 bg-indigo-50/40">
-                      <p className="text-[11px] font-semibold uppercase tracking-wider text-indigo-600">② 题意速览</p>
-                      <h3 className="text-lg font-bold text-slate-900 mt-1 flex items-center gap-2">
-                        <BookOpen size={20} className="text-indigo-500 shrink-0" />
+                  {/* ② 题目摘要 */}
+                  <div className="bg-white rounded-xl shadow-sm border border-slate-200 border-l-[4px] border-l-indigo-500 overflow-hidden flex flex-col">
+                    <div className="px-4 py-2.5 border-b border-slate-100 bg-indigo-50/40 shrink-0">
+                      <p className="text-[10px] font-semibold uppercase tracking-wider text-indigo-600">② 题意速览</p>
+                      <h3 className="text-base font-bold text-slate-900 mt-0.5 flex items-center gap-2">
+                        <BookOpen size={17} className="text-indigo-500 shrink-0" />
                         题目摘要
                       </h3>
-                      <p className="text-sm text-slate-600 mt-1">抓住题干核心，下面每条单独对应一个信息点</p>
                     </div>
-                    <div className="p-5 md:p-6">
-                      <ul className="space-y-4">
+                    <div className="p-4 flex-1 overflow-y-auto max-h-[min(360px,45vh)]">
+                      <ul className="space-y-2.5">
                         {splitIntoKeyPoints(formatMcqOptionsPerLine(analysis.summary)).map((point, idx) => (
                           <li
                             key={`summary-pt-${idx}`}
-                            className="flex gap-3 rounded-xl border border-indigo-100/80 bg-indigo-50/35 px-4 py-3.5"
+                            className="flex gap-2.5 rounded-lg border border-indigo-100/80 bg-indigo-50/35 px-3 py-2.5"
                           >
-                            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-indigo-600 text-xs font-bold text-white shadow-sm">
+                            <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-indigo-600 text-[11px] font-bold text-white">
                               {idx + 1}
                             </span>
-                            <p className="text-slate-800 leading-[1.75] pt-0.5">{point}</p>
+                            <p className="text-sm text-slate-800 leading-relaxed pt-0.5">{point}</p>
                           </li>
                         ))}
                       </ul>
@@ -855,67 +1341,65 @@ export function ZhishitreeMain({
                   </div>
 
                   {/* ③ 错因定位 */}
-                  <div className="bg-white rounded-2xl shadow-sm border border-slate-200 border-l-[5px] border-l-amber-400 overflow-hidden">
-                    <div className="px-5 pt-5 pb-2 border-b border-amber-100/80 bg-amber-50/50">
-                      <p className="text-[11px] font-semibold uppercase tracking-wider text-amber-800">③ 错因拆解</p>
-                      <h3 className="text-lg font-bold text-amber-950 mt-1 flex items-center gap-2">
-                        <Target size={20} className="text-amber-500 shrink-0" />
+                  <div className="bg-white rounded-xl shadow-sm border border-slate-200 border-l-[4px] border-l-amber-400 overflow-hidden flex flex-col">
+                    <div className="px-4 py-2.5 border-b border-amber-100/80 bg-amber-50/50 shrink-0">
+                      <p className="text-[10px] font-semibold uppercase tracking-wider text-amber-800">③ 错因拆解</p>
+                      <h3 className="text-base font-bold text-amber-950 mt-0.5 flex items-center gap-2">
+                        <Target size={17} className="text-amber-500 shrink-0" />
                         错因定位
                       </h3>
-                      <p className="text-sm text-amber-900/80 mt-1">重点看「错在哪、为什么错」，支持 Markdown 与公式</p>
                     </div>
-                    <div className="p-5 md:p-7 text-slate-800">
-                      <MarkdownRenderer content={analysis.specificMistake} density="relaxed" />
+                    <div className="p-4 flex-1 overflow-y-auto max-h-[min(360px,45vh)] text-slate-800">
+                      <MarkdownRenderer content={analysis.specificMistake} density="normal" />
                     </div>
                   </div>
 
                   {/* ④ 易错点 */}
-                  <div className="bg-white rounded-2xl shadow-sm border border-slate-200 border-l-[5px] border-l-rose-400 overflow-hidden">
-                    <div className="px-5 pt-5 pb-2 border-b border-rose-100 bg-rose-50/40">
-                      <p className="text-[11px] font-semibold uppercase tracking-wider text-rose-800">④ 易错预警</p>
-                      <h3 className="text-lg font-bold text-rose-950 mt-1 flex items-center gap-2">
-                        <AlertCircle size={20} className="text-rose-500 shrink-0" />
+                  <div className="bg-white rounded-xl shadow-sm border border-slate-200 border-l-[4px] border-l-rose-400 overflow-hidden flex flex-col 2xl:col-span-1">
+                    <div className="px-4 py-2.5 border-b border-rose-100 bg-rose-50/40 shrink-0">
+                      <p className="text-[10px] font-semibold uppercase tracking-wider text-rose-800">④ 易错预警</p>
+                      <h3 className="text-base font-bold text-rose-950 mt-0.5 flex items-center gap-2">
+                        <AlertCircle size={17} className="text-rose-500 shrink-0" />
                         易错点分析
                       </h3>
-                      <p className="text-sm text-rose-900/80 mt-1">按条排查常见陷阱，考前可对照自查</p>
                     </div>
-                    <div className="p-5 md:p-6">
-                      <ul className="space-y-4">
+                    <div className="p-4 flex-1 overflow-y-auto max-h-[min(360px,45vh)]">
+                      <ul className="space-y-2.5">
                         {analysis.pitfalls.map((pitfall, idx) => (
                           <li
                             key={`pitfall-${idx}`}
-                            className="flex gap-4 rounded-xl border border-rose-100 bg-gradient-to-r from-rose-50/90 to-white px-4 py-4 shadow-sm shadow-rose-100/50"
+                            className="flex gap-2.5 rounded-lg border border-rose-100 bg-gradient-to-r from-rose-50/90 to-white px-3 py-2.5"
                           >
-                            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-rose-600 text-sm font-bold text-white shadow-sm">
+                            <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-rose-600 text-[11px] font-bold text-white">
                               {idx + 1}
                             </span>
-                            <p className="text-slate-800 leading-[1.75] pt-0.5">{pitfall}</p>
+                            <p className="text-sm text-slate-800 leading-relaxed pt-0.5">{pitfall}</p>
                           </li>
                         ))}
                       </ul>
                     </div>
                   </div>
 
-                  {/* ⑤ 知识网络 */}
-                  <div className="bg-white rounded-2xl shadow-sm border border-slate-200 border-l-[5px] border-l-emerald-500 overflow-hidden">
-                    <div className="px-5 pt-5 pb-2 border-b border-emerald-100 bg-emerald-50/40">
-                      <p className="text-[11px] font-semibold uppercase tracking-wider text-emerald-800">⑤ 知识网络</p>
-                      <h3 className="text-lg font-bold text-emerald-950 mt-1 flex items-center gap-2">
-                        <Network size={20} className="text-emerald-500 shrink-0" />
+                  {/* ⑤ 知识网络 — 通栏 */}
+                  <div className="xl:col-span-2 2xl:col-span-3 bg-white rounded-xl shadow-sm border border-slate-200 border-l-[4px] border-l-emerald-500 overflow-hidden">
+                    <div className="px-4 py-2.5 border-b border-emerald-100 bg-emerald-50/40">
+                      <p className="text-[10px] font-semibold uppercase tracking-wider text-emerald-800">⑤ 知识网络</p>
+                      <h3 className="text-base font-bold text-emerald-950 mt-0.5 flex items-center gap-2">
+                        <Network size={17} className="text-emerald-500 shrink-0" />
                         知识网络与结构
+                        <span className="text-xs font-normal text-emerald-800/70 ml-1">
+                          · {analysis.knowledgePoints.length} 考点 · {analysis.knowledgeTree.length} 组节点
+                        </span>
                       </h3>
-                      <p className="text-sm text-emerald-900/80 mt-1">
-                        基于初中科学知识树 · 共 {analysis.knowledgePoints.length} 个核心考点 · {analysis.knowledgeTree.length} 组知识树节点
-                      </p>
                     </div>
-                    <div className="p-5 md:p-6 space-y-10">
+                    <div className="p-4 grid gap-5 lg:grid-cols-2">
                       {/* Knowledge Points */}
                       <div>
-                        <h4 className="text-sm font-bold text-indigo-950 mb-4 flex items-center gap-2 pb-2 border-b border-indigo-100">
-                          <BookOpen size={17} className="text-indigo-500 shrink-0" />
+                        <h4 className="text-xs font-bold text-indigo-950 mb-3 flex items-center gap-2 pb-1.5 border-b border-indigo-100">
+                          <BookOpen size={15} className="text-indigo-500 shrink-0" />
                           核心知识点
                         </h4>
-                        <div className="flex flex-wrap gap-2">
+                        <div className="flex flex-wrap gap-1.5">
                           {analysis.knowledgePoints.map((point, idx) => {
                             const isSelected = selectedPoint === point;
                             const isDimmed = selectedPoint && !isSelected;
@@ -934,19 +1418,19 @@ export function ZhishitreeMain({
                             );
                           })}
                         </div>
-                        <p className="text-xs text-slate-500 mt-4 flex items-center gap-1.5 bg-slate-50 border border-slate-100 rounded-lg px-3 py-2">
-                          <ChevronRight size={14} className="text-indigo-500 shrink-0" />
-                          点击任意知识点可展开下方「详细讲解与例题」
+                        <p className="text-[11px] text-slate-500 mt-2 flex items-center gap-1">
+                          <ChevronRight size={12} className="text-indigo-500 shrink-0" />
+                          点击知识点展开详细讲解
                         </p>
                       </div>
 
                       {/* Knowledge Tree */}
-                      <div className="border-t border-slate-200 pt-8">
-                        <h4 className="text-sm font-bold text-emerald-950 mb-4 flex items-center gap-2 pb-2 border-b border-emerald-100">
-                          <Network size={17} className="text-emerald-500 shrink-0" />
+                      <div>
+                        <h4 className="text-xs font-bold text-emerald-950 mb-3 flex items-center gap-2 pb-1.5 border-b border-emerald-100">
+                          <Network size={15} className="text-emerald-500 shrink-0" />
                           相关知识树
                         </h4>
-                        <div className="space-y-4">
+                        <div className="space-y-2.5 max-h-[min(320px,40vh)] overflow-y-auto pr-1">
                           {analysis.knowledgeTree.map((node, idx) => {
                           const isParentSelected = selectedPoint === node.node;
                           const isChildSelected = node.children.some((child: any) => {
@@ -959,24 +1443,24 @@ export function ZhishitreeMain({
                           return (
                             <div 
                               key={`tree-node-${node.node}-${idx}`} 
-                              className={`rounded-xl p-4 border transition-all duration-300 ${
+                              className={`rounded-lg p-3 border transition-all duration-300 ${
                                 isRelated 
-                                  ? 'bg-emerald-50 border-emerald-200 ring-2 ring-emerald-100' 
+                                  ? 'bg-emerald-50 border-emerald-200 ring-1 ring-emerald-100' 
                                   : 'bg-slate-50 border-slate-100'
                               } ${isDimmed ? 'opacity-40 grayscale-[50%]' : ''}`}
                             >
                               <button 
                                 onClick={() => handlePointClick(node.node)}
-                                className={`font-medium mb-3 flex items-center gap-2 transition-colors text-left ${
+                                className={`text-sm font-medium mb-2 flex items-center gap-2 transition-colors text-left ${
                                   selectedPoint === node.node 
                                     ? 'text-emerald-700 font-bold' 
                                     : 'text-slate-800 hover:text-emerald-600'
                                 }`}
                               >
-                                <div className={`w-2 h-2 rounded-full transition-all ${selectedPoint === node.node ? 'bg-emerald-600 scale-150' : 'bg-emerald-400'}`}></div>
+                                <div className={`w-1.5 h-1.5 rounded-full transition-all ${selectedPoint === node.node ? 'bg-emerald-600 scale-150' : 'bg-emerald-400'}`}></div>
                                 {node.node}
                               </button>
-                              <div className="flex flex-wrap gap-2 pl-4 border-l-2 border-slate-200 ml-1">
+                              <div className="flex flex-wrap gap-1.5 pl-3 border-l-2 border-slate-200 ml-0.5">
                                 {node.children.map((child: any, cIdx: number) => {
                                   const childText = typeof child === 'string' ? child : (child.node || child.name || JSON.stringify(child));
                                   const isThisChildSelected = selectedPoint === childText;
@@ -1005,19 +1489,16 @@ export function ZhishitreeMain({
                   </div>
                   </div>
 
-                  {/* ⑥ 思维交流与盲区检测 */}
-                  <div className="overflow-hidden rounded-2xl border border-slate-200 border-l-[5px] border-l-violet-500 bg-white shadow-sm">
-                    <div className="border-b border-violet-100 bg-violet-50/50 px-5 pt-5 pb-2">
-                      <p className="text-[11px] font-semibold uppercase tracking-wider text-violet-800">⑥ 思维交流</p>
-                      <h3 className="mt-1 flex items-center gap-2 text-lg font-bold text-violet-950">
-                        <MessageCircle size={20} className="shrink-0 text-violet-500" />
+                  {/* ⑥ 思维交流与盲区检测 — 通栏 */}
+                  <div className="xl:col-span-2 2xl:col-span-3 overflow-hidden rounded-xl border border-slate-200 border-l-[4px] border-l-violet-500 bg-white shadow-sm">
+                    <div className="border-b border-violet-100 bg-violet-50/50 px-4 py-2.5">
+                      <p className="text-[10px] font-semibold uppercase tracking-wider text-violet-800">⑥ 思维交流</p>
+                      <h3 className="mt-0.5 flex items-center gap-2 text-base font-bold text-violet-950">
+                        <MessageCircle size={17} className="shrink-0 text-violet-500" />
                         自述错因 · AI 追问 · 相似题检验
                       </h3>
-                      <p className="mt-1 text-sm text-violet-900/80">
-                        先写下你的真实思路；系统结合本题考点与（若有）初中科学知识树命中，归纳盲区并生成追问与变式题，用于检验是否真正理解。
-                      </p>
                     </div>
-                    <div className="space-y-6 p-5 md:p-6">
+                    <div className="space-y-5 p-4">
                       {!user ? (
                         <p className="text-sm text-slate-600">
                           登录后可保存错题并启用本环节（服务器使用 <code className="rounded bg-slate-100 px-1 font-mono text-xs">GEMINI_API_KEY</code>{' '}
@@ -1183,9 +1664,9 @@ export function ZhishitreeMain({
                   </div>
 
                   </div>
-                </motion.div>
+                </div>
               )}
-            </AnimatePresence>
+            </div>
 
             {/* Inline Knowledge Point Details */}
             <AnimatePresence>

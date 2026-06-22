@@ -4,7 +4,7 @@
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path $PSScriptRoot -Parent)
 
-$port = if ($env:PORT) { $env:PORT } else { "8787" }
+$port = if ($env:PORT) { $env:PORT } else { "8790" }
 
 Write-Host "[zhishitree] 释放端口 $port ..."
 Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue |

@@ -1,13 +1,31 @@
 import React from 'react';
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import { isMcqOptionLine } from '../../../shared/formatMcq';
+import { AdaptiveExamFigure } from './AdaptiveExamFigure';
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
+}
+
+/** 允许 OCR 内嵌的 data:image base64，默认 sanitize 会丢弃 data: 协议导致裂图 */
+function markdownUrlTransform(url: string): string {
+  if (url.startsWith('data:image/')) return url;
+  return defaultUrlTransform(url);
+}
+
+function nodeText(children: React.ReactNode): string {
+  if (typeof children === 'string') return children;
+  if (typeof children === 'number') return String(children);
+  if (Array.isArray(children)) return children.map(nodeText).join('');
+  if (React.isValidElement(children) && children.props) {
+    return nodeText((children.props as { children?: React.ReactNode }).children);
+  }
+  return '';
 }
 
 interface MarkdownRendererProps {
@@ -15,6 +33,8 @@ interface MarkdownRendererProps {
   className?: string;
   /** relaxed：段落与列表间距更大，适合长文阅读 */
   density?: 'normal' | 'relaxed';
+  /** 高亮选择题选项段落（题干与选项分开展示） */
+  highlightMcqOptions?: boolean;
 }
 
 /**
@@ -23,13 +43,19 @@ interface MarkdownRendererProps {
  * KaTeX 默认 output 为 html+MathML；MathML 本应被 CSS 裁切隐藏，但 Tailwind Preflight 等可能破坏 clip，
  * 导致页面上与 .katex-html 叠成「每个公式像显示两遍」。导出 Markdown 在其它编辑器里只渲染一轨，故无此现象。
  */
-export function MarkdownRenderer({ content, className, density = 'normal' }: MarkdownRendererProps) {
+export function MarkdownRenderer({
+  content,
+  className,
+  density = 'normal',
+  highlightMcqOptions = false,
+}: MarkdownRendererProps) {
   const relaxed = density === 'relaxed';
 
   return (
     <div className={cn('markdown-body max-w-none', relaxed && 'markdown-body-relaxed', className)}>
       <ReactMarkdown
         remarkPlugins={[remarkMath, remarkGfm]}
+        urlTransform={markdownUrlTransform}
         rehypePlugins={[
           [
             rehypeKatex,
@@ -41,15 +67,25 @@ export function MarkdownRenderer({ content, className, density = 'normal' }: Mar
           ],
         ]}
         components={{
-          p: ({ node, ...props }) => (
-            <p
-              className={cn(
-                'last:mb-0',
-                relaxed ? 'mb-5 leading-[1.75] text-slate-700' : 'mb-4 leading-relaxed',
-              )}
-              {...props}
-            />
-          ),
+          p: ({ node, children, ...props }) => {
+            const isOption =
+              highlightMcqOptions && isMcqOptionLine(nodeText(children).trim());
+            return (
+              <p
+                className={cn(
+                  'last:mb-0',
+                  isOption
+                    ? 'mb-2 leading-relaxed rounded-r-md border-l-2 border-indigo-300 bg-indigo-50/50 py-1.5 pl-3 text-slate-800'
+                    : relaxed
+                      ? 'mb-5 leading-[1.75] text-slate-700'
+                      : 'mb-4 leading-relaxed',
+                )}
+                {...props}
+              >
+                {children}
+              </p>
+            );
+          },
           h1: ({ node, ...props }) => (
             <h1 className={cn('font-bold text-slate-900', relaxed ? 'text-xl mt-8 mb-4' : 'text-2xl mt-6 mb-4')} {...props} />
           ),
@@ -97,10 +133,12 @@ export function MarkdownRenderer({ content, className, density = 'normal' }: Mar
             />
           ),
           img: ({ node, ...props }) => (
-            <img
-              {...props}
-              className="my-3 max-h-96 w-full rounded-lg border border-slate-200 bg-white object-contain"
+            <AdaptiveExamFigure
+              src={String(props.src || '')}
               alt={props.alt || '配图'}
+              className="my-3"
+              imgClassName="rounded-lg border border-slate-200 bg-white object-contain"
+              maxLines={6}
             />
           ),
           code: ({ node, inline, ...props }: any) => {

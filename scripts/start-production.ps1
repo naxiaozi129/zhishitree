@@ -5,7 +5,7 @@ $ErrorActionPreference = "Stop"
 Set-Location (Split-Path $PSScriptRoot -Parent)
 
 $env:NODE_ENV = "production"
-if (-not $env:PORT) { $env:PORT = "8787" }
+if (-not $env:PORT) { $env:PORT = "8790" }
 
 Write-Host "[zhishitree] 构建前端..."
 npm run build

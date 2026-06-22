@@ -28,7 +28,9 @@ function AuthGate({ children }: { children: React.ReactNode }) {
 }
 
 export default function AppRouter() {
-  const { path, setPath } = useHashRoute();
+  const { path, query, setPath } = useHashRoute();
+  const mistakeId = query.mistake ? Number(query.mistake) : undefined;
+  const openMistakeId = Number.isFinite(mistakeId) && mistakeId! > 0 ? mistakeId : undefined;
 
   if (path === 'login') return <LoginPage onDone={() => setPath('home')} />;
 
@@ -40,11 +42,23 @@ export default function AppRouter() {
 
   return (
     <AuthGate>
-      {path === 'records' && <RecordsPage onBack={() => setPath('home')} />}
+      {path === 'records' && (
+        <RecordsPage
+          onBack={() => setPath('home')}
+          onOpenMistake={(id) => setPath('entry', { mistake: id, from: 'records' })}
+        />
+      )}
       {path === 'map' && <KnowledgeMapPage onBack={() => setPath('home')} />}
       {path === 'zhongkao' && <ZhongkaoMaterialsPage onBack={() => setPath('home')} />}
       {path === 'paper' && <PaperAnalysisPage onBack={() => setPath('home')} onNavigate={setPath} />}
-      {path === 'entry' && <ZhishitreeMain onNavigate={setPath} onBack={() => setPath('home')} />}
+      {path === 'entry' && (
+        <ZhishitreeMain
+          mistakeId={openMistakeId}
+          returnTo={query.from === 'records' ? 'records' : 'home'}
+          onNavigate={setPath}
+          onBack={() => setPath(query.from === 'records' ? 'records' : 'home')}
+        />
+      )}
       {path !== 'records' &&
         path !== 'map' &&
         path !== 'zhongkao' &&

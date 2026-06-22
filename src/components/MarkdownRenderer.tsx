@@ -1,5 +1,5 @@
 import React from 'react';
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
@@ -8,6 +8,11 @@ import { twMerge } from 'tailwind-merge';
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
+}
+
+function markdownUrlTransform(url: string): string {
+  if (url.startsWith('data:image/')) return url;
+  return defaultUrlTransform(url);
 }
 
 interface MarkdownRendererProps {
@@ -30,6 +35,7 @@ export function MarkdownRenderer({ content, className, density = 'normal' }: Mar
     <div className={cn('markdown-body max-w-none', relaxed && 'markdown-body-relaxed', className)}>
       <ReactMarkdown
         remarkPlugins={[remarkMath, remarkGfm]}
+        urlTransform={markdownUrlTransform}
         rehypePlugins={[
           [
             rehypeKatex,

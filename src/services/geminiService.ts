@@ -30,17 +30,33 @@ export interface KnowledgePointDetails {
 }
 
 export function figureDataUri(fig: { mime: string; data: string }): string {
-  const d = fig.data.replace(/^data:[^;]+;base64,/, '');
+  const d = fig.data.replace(/^data:[^;]+;base64,/, '').trim();
   return `data:${fig.mime || 'image/jpeg'};base64,${d}`;
+}
+
+export function isValidFigureData(data: string | undefined | null): boolean {
+  if (!data) return false;
+  const d = data.replace(/^data:[^;]+;base64,/, '').trim();
+  return d.length >= 64;
+}
+
+export function figureDataUriIfValid(fig: { mime: string; data: string }): string | null {
+  return isValidFigureData(fig.data) ? figureDataUri(fig) : null;
 }
 
 export function resolveAnalysisImageUri(
   analysis: QuestionAnalysis | null,
   fallbackDataUrl?: string | null,
 ): string | null {
+  if (analysis?.sourceImage) {
+    const uri = figureDataUriIfValid(analysis.sourceImage);
+    if (uri) return uri;
+  }
+  for (const fig of analysis?.figures ?? []) {
+    const uri = figureDataUriIfValid(fig);
+    if (uri) return uri;
+  }
   if (fallbackDataUrl) return fallbackDataUrl;
-  if (analysis?.sourceImage) return figureDataUri(analysis.sourceImage);
-  if (analysis?.figures?.[0]) return figureDataUri(analysis.figures[0]);
   return null;
 }
 
@@ -51,7 +67,10 @@ export function resolveCircuitImageUri(
   const circuit =
     analysis?.figures?.find((f) => f.id === 'fig-circuit') ??
     analysis?.figures?.find((f) => /电路/.test(f.label));
-  if (circuit) return figureDataUri(circuit);
+  if (circuit) {
+    const uri = figureDataUriIfValid(circuit);
+    if (uri) return uri;
+  }
   return resolveAnalysisImageUri(analysis, fallbackDataUrl);
 }
 

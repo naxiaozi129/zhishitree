@@ -5,6 +5,8 @@ type PageChromeProps = {
   title: string;
   subtitle?: string;
   onBack: () => void;
+  /** 宽屏内容区（知识树等大画布页面） */
+  wide?: boolean;
   /** 置于标题行右侧，例如 Tab */
   headerExtra?: React.ReactNode;
   /** 置于主导航下方的二级条（如分段 Tab） */
@@ -15,11 +17,12 @@ type PageChromeProps = {
 /**
  * 内页统一外壳：渐变背景 + 玻璃顶栏，与各功能页风格一致。
  */
-export function PageChrome({ title, subtitle, onBack, headerExtra, subNav, children }: PageChromeProps) {
+export function PageChrome({ title, subtitle, onBack, wide, headerExtra, subNav, children }: PageChromeProps) {
+  const maxW = wide ? 'max-w-[min(1680px,100%)]' : 'max-w-6xl';
   return (
     <div className="min-h-screen bg-gradient-to-b from-slate-50 via-white to-teal-50/40">
       <header className="sticky top-0 z-30 border-b border-slate-200/80 bg-white/85 backdrop-blur-md shadow-sm shadow-slate-200/40">
-        <div className="mx-auto flex h-14 max-w-6xl items-center gap-3 px-4">
+        <div className={`mx-auto flex h-14 ${maxW} items-center gap-3 px-4`}>
           <button
             type="button"
             onClick={onBack}
@@ -38,7 +41,7 @@ export function PageChrome({ title, subtitle, onBack, headerExtra, subNav, child
           <div className="border-t border-slate-100/90 bg-slate-50/90">{subNav}</div>
         ) : null}
       </header>
-      <main className="mx-auto max-w-6xl px-4 py-8">{children}</main>
+      <main className={`mx-auto ${maxW} px-4 ${wide ? 'py-4' : 'py-8'}`}>{children}</main>
     </div>
   );
 }

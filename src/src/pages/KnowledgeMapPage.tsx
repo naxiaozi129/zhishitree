@@ -525,11 +525,12 @@ export function KnowledgeMapPage({ onBack }: { onBack: () => void }) {
 
   return (
     <PageChrome
+      wide
       title="知识关联"
       subtitle="错题知识点共现 · 浙教版初中科学知识树与掌握度"
       onBack={onBack}
       subNav={
-        <div className="mx-auto flex max-w-6xl flex-wrap gap-1 px-4">
+        <div className="mx-auto flex max-w-[min(1680px,100%)] flex-wrap gap-1 px-4">
           <button
             type="button"
             onClick={() => setTab('cooccur')}
@@ -569,7 +570,7 @@ export function KnowledgeMapPage({ onBack }: { onBack: () => void }) {
         </div>
       }
     >
-      <div className="space-y-8">
+      <div className="space-y-4">
         {tab === 'cooccur' && (
           <>
             {loading ? (
@@ -1278,7 +1279,7 @@ function JuniorScienceTreeSection() {
   const verLabel = masteryPayload.treeVersion || treeVersion || '—';
 
   return (
-    <div className="space-y-8">
+    <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
         <p className="text-xs text-slate-500">
           课纲数据版本：<span className="font-mono text-slate-800">{verLabel}</span>
@@ -1330,7 +1331,7 @@ function JuniorScienceTreeSection() {
             onSelectNode={selectNode}
             onPracticeNode={practiceFromNode}
             onRevealPath={revealPath}
-            caption={`参考 AI-OJ 知识树：干线侧枝布局 · 滚轮缩放拖拽平移 · ± 展开子节点 · 单击查看详情 · 双击叶子练习。同级手风琴仅展开一条主枝。已保存错题 ${masteryPayload.mistakeCount} 条。`}
+            caption={`AI-OJ 干线布局 · 滚轮在鼠标处缩放 · 拖拽平移 · 点「居中」重置视图。已保存错题 ${masteryPayload.mistakeCount} 条。`}
           />
         </section>
       ) : null}

@@ -64,10 +64,17 @@ import { testAiModelConnection } from './aiModelTest.js';
 import { checkMineruHealth, checkMineruHealthDetailed, isMineruOcrEnabled } from './mineruOcr.js';
 import { getMineruSettingsPublic, updateMineruSettings } from './mineruSettings.js';
 import {
+  analyzeQuestionFromOcrText,
   analyzeQuestionImageWithAi,
   enrichAnalysisWithSourceMedia,
   explainKnowledgePointWithAi,
+  recognizeQuestionImageOnly,
 } from './questionImageAnalyze.js';
+import {
+  checkExamRecognitionHealth,
+  isExamRecognitionEnabled,
+  type ExamServiceHealthPayload,
+} from './examRecognitionService.js';
 import {
   analysisMatchBlob,
   buildScienceTreeCoverage,
@@ -115,9 +122,10 @@ dotenv.config({ path: path.join(root, '.env') });
 dotenv.config({ path: path.join(root, '.env.local') });
 
 const app = express();
-const PORT = Number(process.env.API_PORT || process.env.PORT || 8787);
+const PORT = Number(process.env.API_PORT || process.env.PORT || 8790);
+const DEV_WEB_PORT = Number(process.env.VITE_DEV_PORT || process.env.DEV_WEB_PORT || 3010);
 
-const corsOrigins = (process.env.CORS_ORIGIN || 'http://localhost:3000,http://localhost:5174')
+const corsOrigins = (process.env.CORS_ORIGIN || `http://localhost:${DEV_WEB_PORT},http://localhost:5180`)
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
@@ -217,6 +225,15 @@ app.get('/api/health', async (_req, res) => {
         apiMode: mineruSettings.apiMode,
       })
     : false;
+  let examRecognition: ExamServiceHealthPayload = {
+    enabled: false,
+    ok: false,
+    message: 'exam-paper-recognition 已禁用',
+  };
+  if (isExamRecognitionEnabled()) {
+    const h = await checkExamRecognitionHealth();
+    examRecognition = { enabled: true, ok: h.ok, message: h.message, detail: h.detail };
+  }
   res.json({
     ok: true,
     mineru: {
@@ -226,6 +243,7 @@ app.get('/api/health', async (_req, res) => {
       enabled: mineruSettings.enabled,
       apiMode: mineruSettings.apiMode,
     },
+    examRecognition,
   });
 });
 
@@ -236,12 +254,13 @@ app.post('/api/analyze/question-image', async (req, res, next) => {
     if (!cfg) return;
     const base64 = String(req.body?.base64 ?? req.body?.base64Image ?? '').trim();
     const mimeType = String(req.body?.mimeType ?? req.body?.mime_type ?? 'image/jpeg').trim();
+    const engine = req.body?.engine === 'exam-service' ? 'exam-service' : 'default';
     if (!base64) {
       res.status(400).json({ error: '请提供图片 base64 数据' });
       return;
     }
     const analysis = enrichAnalysisWithSourceMedia(
-      await analyzeQuestionImageWithAi(cfg, base64, mimeType),
+      await analyzeQuestionImageWithAi(cfg, base64, mimeType, engine),
       base64,
       mimeType,
     );
@@ -255,6 +274,80 @@ app.post('/api/analyze/question-image', async (req, res, next) => {
     console.error('[zhishitree api] analyze/question-image:', e);
     res.status(502).json({ error: msg });
   }
+});
+
+/** 环节 ①：试卷识别（exam-paper-recognition 或内置 MinerU/视觉），返回 OCR 正文供核对编辑 */
+app.post('/api/analyze/recognize-question', async (req, res, next) => {
+  try {
+    const cfg = requireAiConfig(res);
+    if (!cfg) return;
+    const base64 = String(req.body?.base64 ?? req.body?.base64Image ?? '').trim();
+    const mimeType = String(req.body?.mimeType ?? req.body?.mime_type ?? 'image/jpeg').trim();
+    const engine = req.body?.engine === 'exam-service' ? 'exam-service' : 'default';
+    if (!base64) {
+      res.status(400).json({ error: '请提供图片 base64 数据' });
+      return;
+    }
+    const recognition = await recognizeQuestionImageOnly(cfg, base64, mimeType, engine);
+    res.json({ recognition });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : '识别失败';
+    console.error('[zhishitree api] analyze/recognize-question:', e);
+    res.status(502).json({ error: msg });
+  }
+});
+
+/** 环节 ②：对已识别正文做考点分析（不再重复 OCR） */
+app.post('/api/analyze/analyze-recognized', async (req, res, next) => {
+  try {
+    const cfg = requireAiConfig(res);
+    if (!cfg) return;
+    const ocrText = String(req.body?.ocrText ?? req.body?.rawOcrText ?? '').trim();
+    const base64 = String(req.body?.base64 ?? req.body?.base64Image ?? '').trim();
+    const mimeType = String(req.body?.mimeType ?? req.body?.mime_type ?? 'image/jpeg').trim();
+    if (!ocrText) {
+      res.status(400).json({ error: '请提供识别后的题目正文' });
+      return;
+    }
+    const circuitDescription =
+      typeof req.body?.circuitDescription === 'string' ? req.body.circuitDescription : undefined;
+    const figures = Array.isArray(req.body?.figures) ? req.body.figures : undefined;
+    const ocrMeta = req.body?.ocrMeta && typeof req.body.ocrMeta === 'object' ? req.body.ocrMeta : undefined;
+    const originalAnswer =
+      typeof req.body?.originalAnswer === 'string' ? req.body.originalAnswer : undefined;
+    const correctedAnswer =
+      typeof req.body?.correctedAnswer === 'string' ? req.body.correctedAnswer : undefined;
+
+    let analysis = await analyzeQuestionFromOcrText(cfg, ocrText, {
+      circuitDescription,
+      figures,
+      ocrMeta,
+      originalAnswer,
+      correctedAnswer,
+    });
+    if (base64) {
+      analysis = enrichAnalysisWithSourceMedia(analysis, base64, mimeType);
+    }
+    res.json({ analysis });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : '分析失败';
+    if (msg.includes('未配置 AI') || msg.includes('API Key')) {
+      res.status(503).json({ error: msg });
+      return;
+    }
+    console.error('[zhishitree api] analyze/analyze-recognized:', e);
+    res.status(502).json({ error: msg });
+  }
+});
+
+/** exam-paper-recognition（8080 能力中心）可用性，供前端引擎切换显示状态 */
+app.get('/api/analyze/exam-service/health', async (_req, res) => {
+  if (!isExamRecognitionEnabled()) {
+    res.json({ enabled: false, ok: false, message: 'exam-paper-recognition 已禁用（EXAM_RECOGNITION_ENABLED=0）' });
+    return;
+  }
+  const health = await checkExamRecognitionHealth();
+  res.json({ enabled: true, ...health });
 });
 
 /** 知识点详解（走服务端 AI） */
@@ -343,14 +436,24 @@ app.get('/api/auth/me', (req, res) => {
   res.json({ user: publicUserPayload(req.user) });
 });
 
+function mistakeSummaryPreview(analysis: Record<string, unknown>): string {
+  const kps = Array.isArray(analysis.knowledgePoints)
+    ? (analysis.knowledgePoints as unknown[]).filter(
+        (x): x is string => typeof x === 'string' && x.trim().length > 0,
+      )
+    : [];
+  if (kps.length) return kps.slice(0, 3).join('、').slice(0, 240);
+  const summary = typeof analysis.summary === 'string' ? analysis.summary.trim() : '';
+  return summary.slice(0, 240);
+}
+
 app.post('/api/mistakes', requireAuth, (req, res) => {
   const analysis = req.body?.analysis;
   if (!analysis || typeof analysis !== 'object') {
     res.status(400).json({ error: '缺少 analysis 对象' });
     return;
   }
-  const summary = typeof analysis.summary === 'string' ? analysis.summary : '';
-  const preview = summary.slice(0, 240);
+  const preview = mistakeSummaryPreview(analysis as Record<string, unknown>);
   const r = db
     .prepare('INSERT INTO mistakes (user_id, analysis_json, summary_preview) VALUES (?, ?, ?)')
     .run(req.user!.id, JSON.stringify(analysis), preview);
@@ -367,6 +470,24 @@ app.post('/api/mistakes', requireAuth, (req, res) => {
     /* 掌握度同步失败不影响保存错题 */
   }
   res.json({ id: newId, scienceMatches });
+});
+
+app.put('/api/mistakes/:id', requireAuth, (req, res) => {
+  const id = Number(req.params.id);
+  const analysis = req.body?.analysis;
+  if (!analysis || typeof analysis !== 'object') {
+    res.status(400).json({ error: '缺少 analysis 对象' });
+    return;
+  }
+  const preview = mistakeSummaryPreview(analysis as Record<string, unknown>);
+  const r = db
+    .prepare('UPDATE mistakes SET analysis_json = ?, summary_preview = ? WHERE id = ? AND user_id = ?')
+    .run(JSON.stringify(analysis), preview, id, req.user!.id);
+  if (r.changes === 0) {
+    res.status(404).json({ error: '记录不存在' });
+    return;
+  }
+  res.json({ ok: true });
 });
 
 app.get('/api/mistakes', requireAuth, (req, res) => {
@@ -1699,8 +1820,8 @@ if (serveStatic) {
     res.status(200).json({
       ok: true,
       hint: '当前为 API 模式，浏览器请访问前端页面，或运行 npm run start:lan 启动完整服务。',
-      devWeb: `http://${lanHost()}:3000`,
-      prodWeb: `http://${lanHost()}:8787`,
+      devWeb: `http://${lanHost()}:${DEV_WEB_PORT}`,
+      prodWeb: `http://${lanHost()}:${PORT}`,
       health: '/api/health',
     });
   });
@@ -1728,8 +1849,8 @@ function printListenUrls(port: number, mode: 'api' | 'full') {
     console.log(`[zhishitree] 本机访问:   http://127.0.0.1:${port}/`);
   } else {
     console.log(`[zhishitree] API 本机:   http://127.0.0.1:${port}/api/health`);
-    console.log(`[zhishitree] 前端开发:   http://${ip}:3000/ （8787 仅为 API，不能直接打开网页）`);
-    console.log(`[zhishitree] 局域网完整: 请先运行 npm run start:lan → http://${ip}:8787/`);
+    console.log(`[zhishitree] 前端开发:   http://${ip}:${DEV_WEB_PORT}/ （${port} 仅为 API，不能直接打开网页）`);
+    console.log(`[zhishitree] 局域网完整: 请先运行 npm run start:lan → http://${ip}:${port}/`);
   }
 }
 

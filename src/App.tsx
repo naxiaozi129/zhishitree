@@ -4,27 +4,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import * as htmlToImage from 'html-to-image';
 import { analyzeQuestionImage, explainKnowledgePoint, QuestionAnalysis, KnowledgePointDetails } from './services/geminiService';
 import { MarkdownRenderer } from './components/MarkdownRenderer';
-
-/**
- * 选择题选项常见挤在一行：「A. … B. …」或「A.…B.…」。
- * 在选项字母（A–H）及后的 .、． 前插入换行，使每项独占一行。
- */
-function formatMcqOptionsPerLine(text: string): string {
-  let s = text.replace(/\r\n/g, '\n');
-  if (!s.trim()) return s;
-
-  // 无空格紧挨：A.xxxB.yyy
-  s = s.replace(/([A-Ha-h][.．、][^\n]*?)(?=[A-Ha-h][.．、])/g, '$1\n');
-  // 有空格分隔的下一选项：... xxx B. yyy
-  s = s.replace(/([^\n])\s+([A-Ha-h][.．、]\s)/g, '$1\n$2');
-  // (A) (B) 分行
-  s = s.replace(/([^\n])\s*([（(]\s*[A-Ha-h]\s*[）)])/g, '$1\n$2');
-  // 全角选项号 Ａ．Ｂ．（部分 OCR）
-  s = s.replace(/([Ａ-Ｈ][．、][^\n]*?)(?=[Ａ-Ｈ][．、])/g, '$1\n');
-  s = s.replace(/([^\n])\s+([Ａ-Ｈ][．、]\s)/g, '$1\n$2');
-
-  return s.replace(/\n{3,}/g, '\n\n').trimEnd();
-}
+import { formatMcqOptionsPerLine } from './src/utils/formatExamDisplay';
 
 /** 将模型返回的长段文字拆成多条要点，便于分条展示 */
 function splitIntoKeyPoints(text: string): string[] {

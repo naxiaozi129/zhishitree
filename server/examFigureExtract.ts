@@ -66,6 +66,7 @@ function figuresFromParsedImages(images: ParsedMineruImage[]): QuestionFigure[] 
     label: images.length === 1 ? '电路图' : `配图 ${i + 1}`,
     mime: img.mime,
     data: img.data,
+    name: img.name,
     note: 'MinerU 从原题中裁剪的配图',
   }));
 }
@@ -118,13 +119,15 @@ export function embedFiguresInMarkdown(
     byName.set(fig.id, fig);
   }
 
-  // ![](images/xxx.jpg) 或 ![...](xxx.jpg)
+  // ![](images/xxx.jpg) 或 ![...](xxx.jpg) 或 ![...](/api/results/rid/images/xxx.jpg)
   md = md.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (full, alt, src) => {
     const s = String(src).trim();
-    if (s.startsWith('data:') || s.startsWith('http')) return full;
+    if (s.startsWith('data:')) return full;
+    if (s.startsWith('http')) return full;
     const baseName = s.split('/').pop()?.split('?')[0] || s;
     const fig =
       figures.find((f) => f.id === s) ??
+      figures.find((f) => f.name === baseName) ??
       figures.find((f) => (f as QuestionFigure & { name?: string }).name === baseName);
     if (!fig) {
       const idx = figures.length === 1 ? 0 : figures.findIndex((_, i) => s.includes(String(i)));
@@ -213,31 +216,24 @@ export function embedAnalysisFigurePlaceholders(
 
   const embedCircuit = (alt = '电路图') => {
     const uri = uriFor(circuit);
-    return uri ? `![${alt}](${uri})` : '[电路图见原题配图]';
+    return uri ? `![${alt}](fig-circuit)` : '[电路图见原题配图]';
   };
 
   text = text.replace(/\[电路图见原题配图\]/g, () => embedCircuit('电路图'));
 
   text = text.replace(/!\[([^\]]*)\]\((fig-circuit|fig-main)\)/g, (_m, alt) => {
-    const uri = uriFor(circuit);
-    return uri ? `![${alt || '电路图'}](${uri})` : embedCircuit(alt || '电路图');
+    return `![${alt || '电路图'}](fig-circuit)`;
   });
 
-  text = text.replace(/!\[([^\]]*)\]\(fig-main\)/g, (_m, alt) => {
-    const uri = uriFor(circuit);
-    return uri ? `![${alt || '原题配图'}](${uri})` : '![原题配图](fig-main)';
+  text = text.replace(/<!--\s*image\s*-->/gi, () => embedCircuit('电路图'));
+
+  // 避免 rawOcrText 内嵌超大 data URL（localStorage 易截断导致裂图）
+  text = text.replace(/!\[([^\]]*)\]\(data:[^)]+\)/g, (_m, alt) => {
+    return `![${alt || '电路图'}](fig-circuit)`;
   });
 
-  text = text.replace(/<!--\s*image\s*-->/gi, () => {
-    const uri = uriFor(circuit);
-    return uri ? `![电路图](${uri})` : '[电路图见原题配图]';
-  });
-
-  if (/如图|电路/.test(text) && circuit && !/!\[.*?\]\(data:/.test(text)) {
-    const uri = uriFor(circuit);
-    if (uri && !text.includes(uri)) {
-      text = `${text.trim()}\n\n![电路图](${uri})`;
-    }
+  if (/如图|电路/.test(text) && !/!\[.*?\]\(fig-(?:circuit|main)\)/.test(text)) {
+    text = `${text.trim()}\n\n![电路图](fig-circuit)`;
   }
 
   return text;

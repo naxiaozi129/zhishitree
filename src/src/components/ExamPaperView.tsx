@@ -1,5 +1,6 @@
 import React, { useMemo } from 'react';
 import { cn } from './MarkdownRenderer';
+import { AdaptiveExamFigure } from './AdaptiveExamFigure';
 import { expandQuestionStemImages, questionImagesFromBody } from '../utils/questionImages';
 import {
   classifyExamLine,
@@ -64,12 +65,13 @@ function ExamInlineContent({
           const img = imgMap.get(ph[1]);
           if (img) {
             return (
-              <figure key={`img-${idx}`} className="exam-paper-figure">
-                <img src={img.src} alt={img.alt} className="exam-paper-figure-img" loading="lazy" />
-                {img.alt && img.alt !== ph[1] ? (
-                  <figcaption className="exam-paper-figure-cap">{img.alt}</figcaption>
-                ) : null}
-              </figure>
+              <AdaptiveExamFigure
+                key={`img-${idx}`}
+                src={img.src}
+                alt={img.alt}
+                caption={img.alt && img.alt !== ph[1] ? img.alt : undefined}
+                maxLines={6}
+              />
             );
           }
           return (
@@ -79,13 +81,24 @@ function ExamInlineContent({
           );
         }
 
-        const md = seg.match(/^!\[([^\]]*)\]\((data:[^)]+)\)$/);
+        const md = seg.match(/^!\[([^\]]*)\]\(([^)]+)\)$/);
         if (md) {
-          return (
-            <figure key={`img-${idx}`} className="exam-paper-figure">
-              <img src={md[2]} alt={md[1] || '插图'} className="exam-paper-figure-img" loading="lazy" />
-            </figure>
-          );
+          const src = md[2];
+          if (
+            src.startsWith('data:') ||
+            src.startsWith('http://') ||
+            src.startsWith('https://') ||
+            src.startsWith('blob:')
+          ) {
+            return (
+              <AdaptiveExamFigure
+                key={`img-${idx}`}
+                src={src}
+                alt={md[1] || '插图'}
+                maxLines={6}
+              />
+            );
+          }
         }
 
         return <ExamTextBlock key={`t-${idx}`} text={seg} variant={variant} />;

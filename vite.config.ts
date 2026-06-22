@@ -30,19 +30,25 @@ export default defineConfig(({ mode }) => {
     server: {
       // Do not modify—file watching is disabled to prevent flickering during agent edits.
       hmr: process.env.DISABLE_HMR !== 'true',
+      port: Number(env.VITE_DEV_PORT || env.DEV_WEB_PORT || 3010),
+      host: '0.0.0.0',
       proxy: {
         '/api': {
-          target: 'http://127.0.0.1:8787',
+          target:
+            env.VITE_API_PROXY_TARGET ||
+            `http://127.0.0.1:${env.API_PORT || env.PORT || 8790}`,
           changeOrigin: true,
         },
       },
     },
     preview: {
-      port: Number(process.env.PREVIEW_PORT || 5174),
+      port: Number(env.PREVIEW_PORT || 5180),
       host: '0.0.0.0',
       proxy: {
         '/api': {
-          target: 'http://127.0.0.1:8787',
+          target:
+            env.VITE_API_PROXY_TARGET ||
+            `http://127.0.0.1:${env.API_PORT || env.PORT || 8790}`,
           changeOrigin: true,
         },
       },

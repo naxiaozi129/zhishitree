@@ -12,12 +12,28 @@ import {
 } from './aiModelConfig.js';
 import { chatCompletionsUrl, extractOpenAiResponseText } from './llmOpenAiCompat.js';
 import { generateLlmText } from './llmGenerate.js';
-import { isMineruOcrEnabled, parseImageWithMineru } from './mineruOcr.js';
+import { isMineruOcrEnabled } from './mineruOcr.js';
 import { isMineruFallbackVisionEnabled, isOcrLlmCorrectEnabled } from './mineruSettings.js';
 import {
   embedAnalysisFigurePlaceholders,
   postprocessMineruMarkdown,
 } from './examFigureExtract.js';
+import {
+  applyExamPaperRecognitionPipeline,
+  recognizeExamPaperImage,
+  examPaperOcrMetaForVisionFallback,
+  EXAM_PAPER_RECOGNITION_SKILL_ID,
+  type ExamPaperOcrMeta,
+} from './examPaperRecognition.js';
+import { recognizeExamViaService } from './examRecognitionService.js';
+import { extractExamTextFromBuffer } from './paperFileExtract.js';
+
+function isPdfMime(mimeType: string): boolean {
+  return (mimeType || '').toLowerCase().includes('pdf');
+}
+
+/** 识别引擎：default=网页内置（MinerU/视觉），exam-service=8080 能力中心全流程 */
+export type OcrEngine = 'default' | 'exam-service';
 
 export type QuestionFigure = {
   id: string;
@@ -26,6 +42,8 @@ export type QuestionFigure = {
   /** base64 正文（不含 data: 前缀） */
   data: string;
   note?: string;
+  /** MinerU / 8080 返回的原始文件名，用于在 markdown 中匹配图片引用 */
+  name?: string;
 };
 
 export type QuestionAnalysis = {
@@ -35,13 +53,21 @@ export type QuestionAnalysis = {
   knowledgeTree: { node: string; children: string[] }[];
   summary: string;
   specificMistake: string;
+  /** 原题上学生黑色手写答案（原始作答） */
+  originalAnswer?: string;
+  /** 红色笔迹批改/订正后的正确答案 */
+  correctedAnswer?: string;
   /** 原题完整截图，便于对照表格/电路图 */
   sourceImage?: { mime: string; data: string };
   /** 无法纯文字表达的配图（电路图等） */
   figures?: QuestionFigure[];
   /** 电路连接关系文字描述（可选） */
   circuitDescription?: string;
+  /** exam-paper-recognition 流水线元数据（便于确认识别路径） */
+  ocrMeta?: ExamPaperOcrMeta;
 };
+
+export type { ExamPaperOcrMeta } from './examPaperRecognition.js';
 
 export type KnowledgePointDetails = {
   explanation: string;
@@ -90,7 +116,7 @@ const QUESTION_ANALYSIS_SCHEMA = {
         required: ['node', 'children'],
       },
     },
-    summary: { type: Type.STRING, description: '题目摘要' },
+    summary: { type: Type.STRING, description: '一句话考点总结（核心考查点，勿复述题干）' },
     specificMistake: {
       type: Type.STRING,
       description: '具体错误分析（Markdown）',
@@ -154,6 +180,104 @@ function isOcrRefusal(text: string): boolean {
   );
 }
 
+function buildHandwrittenAnswersPrompt(): string {
+  return `【任务】按笔迹颜色区分并转录题目图片中的手写作答。
+
+【颜色区分（重要）】
+- **黑色笔迹**：学生最初做题时写下的**原始答案**（圈选选项、填空、计算过程、草稿等）
+- **红色笔迹**：事后批改/订正时写上的内容（老师或学生用红笔标注的**正确答案**、改错、勾画等）
+- 印刷体题目、印刷体选项 → **不要**抄写
+- 蓝笔等其他颜色：一般忽略；若无法区分黑/红时可简要记入 black
+
+【输出】只输出一个 JSON 对象，不要 Markdown 代码块，不要其他文字：
+{"black":"黑色手写内容","red":"红色手写内容"}
+- 没有某颜色笔迹时，对应键值为空字符串 ""
+- 看不清用 [?]`;
+}
+
+function normalizeHandwrittenField(text: string, color: 'black' | 'red'): string {
+  const t = text.trim().replace(/^```[\w]*\n?|```$/g, '').trim();
+  if (!t || t === '无' || /^(无|没有|未发现|未识别到).{0,12}(手写|笔迹|作答|批改)/i.test(t)) return '';
+  const prefixes =
+    color === 'black'
+      ? [/^(学生)?(原始)?手写答案[：:\s]*/i, /^黑色[笔迹答案作答]*[：:\s]*/i]
+      : [/^(批改|订正|红色)[笔迹答案作答]*[：:\s]*/i, /^red[：:\s]*/i];
+  let out = t;
+  for (const re of prefixes) out = out.replace(re, '').trim();
+  return out;
+}
+
+function parseHandwrittenAnswersResponse(text: string): { originalAnswer: string; correctedAnswer: string } {
+  const trimmed = text.trim();
+  try {
+    const parsed = parseJsonFromText<{ black?: string; red?: string; blackAnswer?: string; redAnswer?: string }>(
+      trimmed,
+    );
+    const blackRaw = String(parsed.black ?? parsed.blackAnswer ?? '').trim();
+    const redRaw = String(parsed.red ?? parsed.redAnswer ?? '').trim();
+    return {
+      originalAnswer: normalizeHandwrittenField(blackRaw, 'black'),
+      correctedAnswer: normalizeHandwrittenField(redRaw, 'red'),
+    };
+  } catch {
+    // 兼容旧版纯文本（仅黑色）
+    return {
+      originalAnswer: normalizeHandwrittenField(trimmed, 'black'),
+      correctedAnswer: '',
+    };
+  }
+}
+
+/** 视觉模型按颜色识别手写答案：黑=原始作答，红=批改正确答案 */
+async function extractHandwrittenAnswers(
+  ocrCfg: Pick<ResolvedAiConfig, 'apiKey' | 'modelId' | 'provider' | 'baseUrl'>,
+  base64: string,
+  mimeType: string,
+): Promise<{ originalAnswer: string; correctedAnswer: string }> {
+  if (process.env.AI_HANDWRITTEN_ANSWER === '0') return { originalAnswer: '', correctedAnswer: '' };
+  const prompt = buildHandwrittenAnswersPrompt();
+  const raw = stripBase64Prefix(base64);
+  const empty = { originalAnswer: '', correctedAnswer: '' };
+
+  const apply = (text: string, modelId?: string) => {
+    if (isOcrRefusal(text)) return empty;
+    const parsed = parseHandwrittenAnswersResponse(text);
+    if (parsed.originalAnswer || parsed.correctedAnswer) {
+      console.log(
+        `[zhishitree] 手写答案识别成功${modelId ? ` (${modelId})` : ''} black=${parsed.originalAnswer.length} red=${parsed.correctedAnswer.length}`,
+      );
+    }
+    return parsed;
+  };
+
+  try {
+    if (ocrCfg.provider === 'gemini') {
+      const text = await generateGeminiVisionPlainText(ocrCfg, raw, mimeType, prompt);
+      return apply(text);
+    }
+    if (ocrCfg.provider === 'zhipu') {
+      const candidates = resolveZhipuVisionModelCandidates(ocrCfg.modelId).slice(0, 3);
+      for (const modelId of candidates) {
+        try {
+          const text = await callZhipuVisionOnce(ocrCfg, raw, mimeType, prompt, modelId);
+          const parsed = apply(text, modelId);
+          if (parsed.originalAnswer || parsed.correctedAnswer) return parsed;
+        } catch (e) {
+          console.warn(`[zhishitree] 手写答案识别失败 (${modelId}):`, e);
+        }
+      }
+    }
+    const geminiBoost = resolveGeminiCredentials();
+    if (geminiBoost?.apiKey && process.env.AI_OCR_USE_GEMINI !== '0') {
+      const text = await generateGeminiVisionPlainText(geminiBoost, raw, mimeType, prompt);
+      return apply(text);
+    }
+  } catch (e) {
+    console.warn('[zhishitree] 手写答案识别失败:', e);
+  }
+  return empty;
+}
+
 function buildOcrPrompt(): string {
   return `【任务】读取用户上传的题目图片，逐字转录图中全部文字。
 
@@ -171,20 +295,40 @@ function buildOcrPrompt(): string {
 5. **电路图/示意图**：先尽量用文字描述连接关系（如「电源、开关S、电流表A、定值电阻R、滑动变阻器串联；电压表V并联在R两端」）；若无法准确还原拓扑，在转录末尾单独一行写：[电路图见原题配图]
 6. 滑动变阻器规格、电表量程、定值电阻阻值等参数必须与原图一致。
 7. 看不清的字用 [?] 标注，禁止猜测。
+8. **选择题**：题干与选项分开；每个选项（A. B. C. D. 等）单独占一行，选项之间空一行。
 
 直接输出转录正文，不要 JSON，不要 Markdown 代码块，不要加「以下是」等前缀。`;
 }
 
-function buildAnalysisFromTextPrompt(ocrText: string): string {
+function buildAnalysisFromTextPrompt(
+  ocrText: string,
+  handwritten?: { originalAnswer?: string; correctedAnswer?: string },
+): string {
   const clipped =
     ocrText.length > 6000 ? `${ocrText.slice(0, 6000)}\n…（OCR 已截断，完整原文由系统保留）` : ocrText;
+  const blocks: string[] = [];
+  if (handwritten?.originalAnswer?.trim()) {
+    blocks.push(
+      `【学生原始作答（黑色笔迹）】学生最初做题时写下的答案，错因分析应主要对照此项：\n${handwritten.originalAnswer.trim()}`,
+    );
+  }
+  if (handwritten?.correctedAnswer?.trim()) {
+    blocks.push(
+      `【批改正确答案（红色笔迹）】事后用红笔标注的订正/正确答案，可与黑色原始作答对比：\n${handwritten.correctedAnswer.trim()}`,
+    );
+  }
+  const handBlock = blocks.length ? `\n${blocks.join('\n\n')}\n` : '';
+  const handHint =
+    blocks.length > 0
+      ? '\n若同时有黑色原始作答与红色批改答案，specificMistake 应对比两者说明错在哪里、正确应是什么。\n'
+      : '';
   return `你是初中科学（含物理）教师。下面是一道题目的 OCR 原文，请**严格基于原文**分析。
-
+${handBlock}${handHint}
 **只输出一个 JSON 对象**，不要 Markdown 代码块，不要任何 JSON 之外的文字。JSON 键名固定为：
 - knowledgePoints：字符串数组，2～6 条核心考点
 - pitfalls：字符串数组，1～4 条易错点
 - knowledgeTree：数组，元素形如 {"node":"物理-电学","children":["欧姆定律"]}
-- summary：字符串，一句话题意
+- summary：字符串，一句话考点总结（写考查的核心知识点/能力，勿复述题干原文）
 - specificMistake：字符串，错因/难点（Markdown，简洁）
 - circuitDescription：字符串，若有电路图则简述连接关系，否则 ""
 
@@ -196,7 +340,7 @@ ${clipped}
 ---`;
 }
 
-type OcrExtractSource = 'mineru' | 'vision';
+type OcrExtractSource = 'mineru' | 'vision' | 'pdf-text';
 
 function buildOcrCorrectionPrompt(rawOcr: string, source: OcrExtractSource): string {
   const clipped =
@@ -511,36 +655,114 @@ type OcrExtractResult = {
   circuitDescription?: string;
   source: OcrExtractSource;
   figures?: QuestionFigure[];
+  ocrMeta: ExamPaperOcrMeta;
 };
+
+/** 通过 8080 能力中心识别（parse + cleanup + AI 纠错），失败时回退默认链路 */
+async function extractOcrViaExamService(
+  base64: string,
+  mimeType: string,
+): Promise<OcrExtractResult> {
+  const svc = await recognizeExamViaService(base64, mimeType);
+  const rawData = stripBase64Prefix(base64);
+  const parsedImages = (svc.figures ?? []).map((f) => ({
+    name: f.name,
+    mime: f.mime,
+    data: f.data,
+  }));
+  const processed = postprocessMineruMarkdown({
+    markdown: svc.markdown,
+    parsedImages,
+    fallbackCircuit: rawData ? { mime: mimeType || 'image/jpeg', data: rawData } : undefined,
+  });
+  const piped = applyExamPaperRecognitionPipeline(processed.markdown);
+  const backendLabel = `exam-paper-recognition · ${svc.mode || 'cloud_precision'}${
+    svc.llmValidated ? ` · AI纠错${svc.correctionCount}处` : ''
+  }`;
+  console.log(
+    `[zhishitree] [exam-service] 识别完成 正文=${piped.fullText.length}字 配图=${processed.figures?.length ?? 0}（下载 ${parsedImages.length}） ${backendLabel}`,
+  );
+  return {
+    text: piped.fullText,
+    source: 'mineru',
+    figures: processed.figures,
+    ocrMeta: {
+      pipeline: EXAM_PAPER_RECOGNITION_SKILL_ID,
+      skillVersion: '1',
+      source: 'mineru',
+      mineruBackend: backendLabel,
+    },
+  };
+}
 
 async function extractOcrFromImage(
   ocrCfg: Pick<ResolvedAiConfig, 'apiKey' | 'modelId' | 'provider' | 'baseUrl'>,
   base64: string,
   mimeType: string,
+  engine: OcrEngine = 'default',
 ): Promise<OcrExtractResult> {
-  if (isMineruOcrEnabled()) {
+  if (engine === 'exam-service') {
     try {
-      const mineru = await parseImageWithMineru(base64, mimeType);
-      const rawData = stripBase64Prefix(base64);
-      const processed = postprocessMineruMarkdown({
-        markdown: mineru.markdown,
-        parsedImages: mineru.images,
-        fallbackCircuit: rawData ? { mime: mimeType || 'image/jpeg', data: rawData } : undefined,
-      });
-      return {
-        text: processed.markdown,
-        source: 'mineru',
-        figures: processed.figures,
-      };
+      return await extractOcrViaExamService(base64, mimeType);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      console.warn('[zhishitree] MinerU OCR 失败:', msg);
-      if (!isMineruFallbackVisionEnabled()) {
-        throw new Error(`MinerU 识别失败：${msg}`);
+      console.warn('[zhishitree] [exam-service] 识别失败，回退默认识别链路:', msg);
+      if (!isMineruFallbackVisionEnabled() && !isMineruOcrEnabled()) {
+        throw new Error(`exam-paper-recognition 服务识别失败：${msg}`);
       }
     }
   }
 
+  if (isMineruOcrEnabled()) {
+    try {
+      const skill = await recognizeExamPaperImage(base64, mimeType);
+      return {
+        text: skill.text,
+        source: 'mineru',
+        figures: skill.figures,
+        ocrMeta: skill.meta,
+      };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.warn(`[zhishitree] [${EXAM_PAPER_RECOGNITION_SKILL_ID}] MinerU 失败:`, msg);
+      if (!isMineruFallbackVisionEnabled()) {
+        throw new Error(`${EXAM_PAPER_RECOGNITION_SKILL_ID} 识别失败：${msg}`);
+      }
+      console.warn(`[zhishitree] [${EXAM_PAPER_RECOGNITION_SKILL_ID}] 回退视觉大模型 OCR`);
+    }
+  } else {
+    console.warn(
+      `[zhishitree] [${EXAM_PAPER_RECOGNITION_SKILL_ID}] MinerU 未配置，使用视觉大模型（非 skill 主路径）`,
+    );
+  }
+
+  if (isPdfMime(mimeType)) {
+    try {
+      const buf = Buffer.from(stripBase64Prefix(base64), 'base64');
+      const extracted = await extractExamTextFromBuffer(buf, '.pdf');
+      if (extracted.text.trim().length >= 8) {
+        const piped = applyExamPaperRecognitionPipeline(extracted.text);
+        console.log(`[zhishitree] PDF 纯文本提取成功，长度 ${piped.fullText.length}`);
+        return {
+          text: piped.fullText,
+          source: 'pdf-text',
+          ocrMeta: {
+            pipeline: EXAM_PAPER_RECOGNITION_SKILL_ID,
+            skillVersion: '1',
+            source: 'pdf-text',
+            mineruBackend: 'pdf-parse',
+          },
+        };
+      }
+    } catch (e) {
+      console.warn('[zhishitree] PDF 纯文本提取失败:', e);
+    }
+    throw new Error(
+      'PDF 识别失败：扫描版请选用 exam-paper-recognition 服务或配置 MinerU；电子版若无文字层可尝试导出为图片上传',
+    );
+  }
+
+  const visionMeta = examPaperOcrMetaForVisionFallback();
   let best = '';
   let circuitDescription = '';
 
@@ -548,17 +770,20 @@ async function extractOcrFromImage(
     try {
       const jsonOcr = await generateGeminiOcrJson(ocrCfg, base64, mimeType);
       if (jsonOcr.rawOcrText?.trim()) {
+        const piped = applyExamPaperRecognitionPipeline(jsonOcr.rawOcrText.trim());
         return {
-          text: jsonOcr.rawOcrText.trim(),
+          text: piped.fullText,
           circuitDescription: jsonOcr.circuitDescription?.trim(),
           source: 'vision',
+          ocrMeta: visionMeta,
         };
       }
     } catch (e) {
       console.warn('[zhishitree] Gemini JSON OCR 失败，改用纯文本 OCR:', e);
     }
     const plain = await generateGeminiVisionPlainText(ocrCfg, base64, mimeType, buildOcrPrompt());
-    return { text: plain, source: 'vision' };
+    const pipedPlain = applyExamPaperRecognitionPipeline(plain);
+    return { text: pipedPlain.fullText, source: 'vision', ocrMeta: visionMeta };
   }
 
   const candidates = resolveZhipuVisionModelCandidates(ocrCfg.modelId).slice(0, 3);
@@ -599,20 +824,27 @@ async function extractOcrFromImage(
   }
 
   console.log(`[zhishitree] 视觉 OCR 最终得分 ${scoreOcrQuality(best)}，长度 ${best.length}`);
-  return { text: best, circuitDescription: circuitDescription || undefined, source: 'vision' };
+  const piped = applyExamPaperRecognitionPipeline(best);
+  return {
+    text: piped.fullText,
+    circuitDescription: circuitDescription || undefined,
+    source: 'vision',
+    ocrMeta: visionMeta,
+  };
 }
 
 async function analyzeOcrText(
   cfg: Pick<ResolvedAiConfig, 'apiKey' | 'modelId' | 'provider' | 'baseUrl'>,
   ocrText: string,
   presetCircuit?: string,
+  handwritten?: { originalAnswer?: string; correctedAnswer?: string },
 ): Promise<QuestionAnalysis> {
   if (isOcrRefusal(ocrText)) {
     throw new Error(
       'OCR 结果无效（模型未真正读取图片）。请确认使用视觉模型 glm-4.6v / glm-4v-flash，勿用 glm-5.2 等纯文本模型识图。',
     );
   }
-  const prompt = buildAnalysisFromTextPrompt(ocrText);
+  const prompt = buildAnalysisFromTextPrompt(ocrText, handwritten);
   let parsed: QuestionAnalysis;
   try {
     const rawJson = await generateLlmText(cfg, prompt, { maxTokens: 4096, temperature: 0.3 });
@@ -632,6 +864,12 @@ async function analyzeOcrText(
   parsed.rawOcrText = ocrText.trim() || parsed.rawOcrText?.trim() || '';
   if (presetCircuit?.trim() && !parsed.circuitDescription?.trim()) {
     parsed.circuitDescription = presetCircuit.trim();
+  }
+  if (handwritten?.originalAnswer?.trim()) {
+    parsed.originalAnswer = handwritten.originalAnswer.trim();
+  }
+  if (handwritten?.correctedAnswer?.trim()) {
+    parsed.correctedAnswer = handwritten.correctedAnswer.trim();
   }
   if (!parsed.knowledgePoints?.length) parsed.knowledgePoints = [];
   if (!parsed.pitfalls?.length) parsed.pitfalls = [];
@@ -674,6 +912,7 @@ export async function analyzeQuestionImageWithAi(
   activeCfg: Pick<ResolvedAiConfig, 'apiKey' | 'modelId' | 'provider' | 'baseUrl'>,
   base64: string,
   mimeType: string,
+  engine: OcrEngine = 'default',
 ): Promise<QuestionAnalysis> {
   if (!supportsVision(activeCfg.provider) && activeCfg.provider !== 'zhipu' && activeCfg.provider !== 'gemini') {
     throw new Error('当前 AI 提供商不支持图片分析，请在管理后台切换为 Gemini 或智谱 AI');
@@ -682,11 +921,13 @@ export async function analyzeQuestionImageWithAi(
   const ocrCfg = resolveOcrCredentials(activeCfg as ResolvedAiConfig) ?? activeCfg;
   const ocrMode = (process.env.AI_OCR_MODE || 'quality').trim().toLowerCase();
 
-  // MinerU 优先时跳过 Gemini 一步识图
+  // MinerU / exam-service 优先时跳过 Gemini 一步识图
   if (
+    engine === 'default' &&
     ocrCfg.provider === 'gemini' &&
     ocrMode !== 'two-step' &&
-    !isMineruOcrEnabled()
+    !isMineruOcrEnabled() &&
+    !isPdfMime(mimeType)
   ) {
     try {
       console.log('[zhishitree] 使用 Gemini 高质量一步识图');
@@ -696,14 +937,14 @@ export async function analyzeQuestionImageWithAi(
     }
   }
 
-  const { text: ocrText, circuitDescription, source, figures: ocrFigures } = await extractOcrFromImage(
-    ocrCfg,
-    base64,
-    mimeType,
-  );
+  const { text: ocrText, circuitDescription, source, figures: ocrFigures, ocrMeta } =
+    await extractOcrFromImage(ocrCfg, base64, mimeType, engine);
   if (!ocrText.trim()) {
     throw new Error('OCR 未识别到文字，请换更清晰的图片重试');
   }
+  console.log(
+    `[zhishitree] [${ocrMeta.pipeline}] OCR 完成 source=${ocrMeta.source} backend=${ocrMeta.mineruBackend ?? '—'} len=${ocrText.length}`,
+  );
 
   const corrected = await correctOcrWithLlm(activeCfg, ocrText, source);
   const finalCircuit = corrected.circuitDescription || circuitDescription;
@@ -711,6 +952,95 @@ export async function analyzeQuestionImageWithAi(
   if (ocrFigures?.length) {
     analysis.figures = ocrFigures;
   }
+  analysis.ocrMeta = ocrMeta;
+  return analysis;
+}
+
+export type QuestionRecognitionResult = {
+  rawOcrText: string;
+  /** 黑色笔迹：学生原始作答 */
+  originalAnswer?: string;
+  /** 红色笔迹：批改后的正确答案 */
+  correctedAnswer?: string;
+  circuitDescription?: string;
+  figures?: QuestionFigure[];
+  ocrMeta: ExamPaperOcrMeta;
+};
+
+/** 环节 ①：仅试卷识别（exam-paper-recognition / MinerU / 视觉 OCR），不做考点分析 */
+export async function recognizeQuestionImageOnly(
+  activeCfg: Pick<ResolvedAiConfig, 'apiKey' | 'modelId' | 'provider' | 'baseUrl'>,
+  base64: string,
+  mimeType: string,
+  engine: OcrEngine = 'default',
+): Promise<QuestionRecognitionResult> {
+  if (!supportsVision(activeCfg.provider) && activeCfg.provider !== 'zhipu' && activeCfg.provider !== 'gemini') {
+    throw new Error('当前 AI 提供商不支持图片识别，请在管理后台切换为 Gemini 或智谱 AI');
+  }
+
+  const ocrCfg = resolveOcrCredentials(activeCfg as ResolvedAiConfig) ?? activeCfg;
+  const { text, circuitDescription, source, figures, ocrMeta } = await extractOcrFromImage(
+    ocrCfg,
+    base64,
+    mimeType,
+    engine,
+  );
+  if (!text.trim()) {
+    throw new Error('OCR 未识别到文字，请换更清晰的图片重试');
+  }
+
+  let finalText = text;
+  let finalCircuit = circuitDescription;
+  // exam-service 已在 8080 完成 cleanup + AI 纠错，不再二次校正
+  if (engine !== 'exam-service') {
+    const corrected = await correctOcrWithLlm(activeCfg, text, source);
+    finalText = corrected.text;
+    finalCircuit = corrected.circuitDescription || circuitDescription;
+  }
+
+  const piped = applyExamPaperRecognitionPipeline(finalText.trim());
+  console.log(
+    `[zhishitree] [${ocrMeta.pipeline}] 识别环节完成 engine=${engine} len=${piped.fullText.length}`,
+  );
+
+  const { originalAnswer, correctedAnswer } = await extractHandwrittenAnswers(ocrCfg, base64, mimeType);
+  if (originalAnswer || correctedAnswer) {
+    console.log(
+      `[zhishitree] 手写答案 black=${originalAnswer.length} red=${correctedAnswer.length}`,
+    );
+  }
+
+  return {
+    rawOcrText: piped.fullText,
+    originalAnswer: originalAnswer || undefined,
+    correctedAnswer: correctedAnswer || undefined,
+    circuitDescription: finalCircuit,
+    figures,
+    ocrMeta,
+  };
+}
+
+/** 环节 ②：基于已识别（可编辑）正文做考点 / 错因 / 知识树分析 */
+export async function analyzeQuestionFromOcrText(
+  activeCfg: Pick<ResolvedAiConfig, 'apiKey' | 'modelId' | 'provider' | 'baseUrl'>,
+  ocrText: string,
+  opts?: {
+    circuitDescription?: string;
+    figures?: QuestionFigure[];
+    ocrMeta?: ExamPaperOcrMeta;
+    originalAnswer?: string;
+    correctedAnswer?: string;
+  },
+): Promise<QuestionAnalysis> {
+  const trimmed = ocrText.trim();
+  if (!trimmed) throw new Error('识别正文为空，请先完成题目识别或填写文字');
+  const piped = applyExamPaperRecognitionPipeline(trimmed);
+  const analysis = await analyzeOcrText(activeCfg, piped.fullText, opts?.circuitDescription, {
+    originalAnswer: opts?.originalAnswer,
+    correctedAnswer: opts?.correctedAnswer,
+  });
+  if (opts?.figures?.length) analysis.figures = opts.figures;
+  if (opts?.ocrMeta) analysis.ocrMeta = opts.ocrMeta;
   return analysis;
 }
 
@@ -753,6 +1083,9 @@ export function enrichAnalysisWithSourceMedia(
   const data = stripBase64Prefix(base64);
   const mime = mimeType || 'image/jpeg';
   const out: QuestionAnalysis = { ...analysis };
+
+  const piped = applyExamPaperRecognitionPipeline(out.rawOcrText || '');
+  out.rawOcrText = piped.fullText;
 
   out.sourceImage = { mime, data };
 

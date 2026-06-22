@@ -2,8 +2,11 @@ import type { JuniorScienceTreeNode } from '../services/api';
 
 export const OJ_NODE_W = 160;
 export const OJ_NODE_H = 52;
+export const OJ_NODE_GAP_X = 28;
+export const OJ_NODE_GAP_Y = 20;
 export const OJ_BRANCH_GAP = 176;
-export const OJ_ROW_STEP = 42;
+/** 行距须大于节点高度，否则相邻层级会垂直重叠 */
+export const OJ_ROW_STEP = OJ_NODE_H + OJ_NODE_GAP_Y;
 export const OJ_MASTERY_LIT = 85;
 
 export type OjPlacedNode = {
@@ -124,44 +127,63 @@ function assignRouteLayout(node: InternalNode, x: number) {
   }
 }
 
-function compressNonLeafTowardTrunk(nodes: InternalNode[]) {
-  const byId = new Map(nodes.map((n) => [n.id, n]));
-  for (const node of nodes) {
-    if (!node.parentId) continue;
-    const parent = byId.get(node.parentId);
-    if (!parent || parent.children.length <= 1) continue;
-    if (!node.children.length) continue;
-    const trunkX = parent.x;
-    node.x = trunkX + (node.x - trunkX) * 0.22;
-  }
+function minCenterGapX() {
+  return OJ_NODE_W + OJ_NODE_GAP_X;
 }
 
+function minCenterGapY() {
+  return OJ_NODE_H + OJ_NODE_GAP_Y;
+}
+
+/** 全局碰撞消解：同层水平推开 + 跨层矩形重叠检测 */
 function resolveCollisions(allNodes: InternalNode[]) {
-  const bandHeight = OJ_NODE_H + 46;
-  const minGap = (n: InternalNode) => (n.children.length ? OJ_NODE_W + 24 : OJ_NODE_W + 44);
-  const bands = new Map<number, InternalNode[]>();
-  for (const n of allNodes) {
-    const key = Math.round(n.y / bandHeight);
-    if (!bands.has(key)) bands.set(key, []);
-    bands.get(key)!.push(n);
-  }
-  for (const band of bands.values()) {
-    if (band.length <= 1) continue;
-    const center = band.reduce((s, n) => s + n.x, 0) / band.length;
-    for (let pass = 0; pass < 3; pass++) {
-      band.sort((a, b) => a.x - b.x);
-      for (let i = 1; i < band.length; i++) {
-        const gap = Math.max(minGap(band[i - 1]), minGap(band[i]));
-        if (band[i].x - band[i - 1].x < gap) band[i].x = band[i - 1].x + gap;
-      }
-      for (let i = band.length - 2; i >= 0; i--) {
-        const gap = Math.max(minGap(band[i + 1]), minGap(band[i]));
-        if (band[i + 1].x - band[i].x < gap) band[i].x = band[i + 1].x - gap;
+  if (allNodes.length <= 1) return;
+
+  const gapX = minCenterGapX();
+  const gapY = minCenterGapY();
+
+  for (let pass = 0; pass < 16; pass++) {
+    let moved = false;
+
+    const byDepth = new Map<number, InternalNode[]>();
+    for (const n of allNodes) {
+      const row = byDepth.get(n.depth) ?? [];
+      row.push(n);
+      byDepth.set(n.depth, row);
+    }
+    for (const row of byDepth.values()) {
+      if (row.length <= 1) continue;
+      row.sort((a, b) => a.x - b.x);
+      for (let i = 1; i < row.length; i++) {
+        if (row[i].x - row[i - 1].x < gapX) {
+          row[i].x = row[i - 1].x + gapX;
+          moved = true;
+        }
       }
     }
-    const shifted = band.reduce((s, n) => s + n.x, 0) / band.length;
-    const offset = shifted - center;
-    if (offset !== 0) band.forEach((n) => { n.x -= offset; });
+
+    for (let i = 0; i < allNodes.length; i++) {
+      for (let j = i + 1; j < allNodes.length; j++) {
+        const a = allNodes[i];
+        const b = allNodes[j];
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const overlapX = gapX - Math.abs(dx);
+        const overlapY = gapY - Math.abs(dy);
+        if (overlapX <= 0 || overlapY <= 0) continue;
+        const shift = overlapX / 2 + 1;
+        if (dx >= 0) {
+          a.x -= shift;
+          b.x += shift;
+        } else {
+          a.x += shift;
+          b.x -= shift;
+        }
+        moved = true;
+      }
+    }
+
+    if (!moved) break;
   }
 }
 
@@ -190,13 +212,13 @@ export function layoutOjKnowledgeTree(
     assignRouteLayout(root, cursorX);
     const subtree: InternalNode[] = [];
     flattenInternal(root, subtree);
-    compressNonLeafTowardTrunk(subtree);
-    resolveCollisions(subtree);
     allInternal.push(...subtree);
     const maxX = Math.max(...subtree.map((n) => n.x));
     const minX = Math.min(...subtree.map((n) => n.x));
-    cursorX += maxX - minX + OJ_BRANCH_GAP * 1.2;
+    cursorX += maxX - minX + minCenterGapX();
   }
+
+  resolveCollisions(allInternal);
 
   const nodes: OjPlacedNode[] = allInternal.map((n) => ({
     id: n.id,
@@ -231,7 +253,7 @@ export function layoutOjKnowledgeTree(
   const padX = OJ_NODE_W;
   const padY = OJ_NODE_H + 80;
   const width = Math.max(960, Math.max(...xs) - Math.min(...xs) + padX * 2);
-  const height = Math.max(640, Math.max(...ys) * OJ_ROW_STEP + padY * 2);
+  const height = Math.max(640, Math.max(...ys) + OJ_NODE_H + padY);
 
   return { nodes, edges, width, height };
 }

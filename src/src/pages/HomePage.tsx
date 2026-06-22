@@ -33,7 +33,7 @@ const menu = [
   {
     id: 'records' as const,
     title: '错题本',
-    desc: '云端同步的错题记录，查看摘要、知识树映射并可纠错映射关系。',
+    desc: '云端同步的错题记录；点击题目可回到完整解析页，保留思维交流过程。',
     icon: BookOpen,
     gradient: 'from-sky-500 to-blue-600',
     ring: 'ring-sky-200/80',

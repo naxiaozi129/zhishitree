@@ -96,6 +96,45 @@ export async function saveMistakeIfAuthed(analysis: QuestionAnalysis): Promise<S
   }
 }
 
+export type UpdateMistakeResult =
+  | { ok: true }
+  | { ok: false; reason: 'not_logged_in' | 'not_approved' | 'not_found' | 'api_error'; message: string };
+
+/** 更新已有错题的解析 JSON（补传原题图等，不新建记录） */
+export async function updateMistakeIfAuthed(
+  id: number,
+  analysis: QuestionAnalysis,
+): Promise<UpdateMistakeResult> {
+  try {
+    const r = await fetch(`/api/mistakes/${id}`, {
+      method: 'PUT',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ analysis }),
+    });
+    const data = await parseResponseJson<{ ok?: boolean; error?: string }>(r);
+    if (r.status === 401) {
+      return { ok: false, reason: 'not_logged_in', message: '未登录' };
+    }
+    if (r.status === 403) {
+      return {
+        ok: false,
+        reason: 'not_approved',
+        message: data.error || '账号尚未通过审核',
+      };
+    }
+    if (r.status === 404) {
+      return { ok: false, reason: 'not_found', message: '错题记录不存在' };
+    }
+    if (!r.ok) {
+      return { ok: false, reason: 'api_error', message: data.error || `更新失败 (${r.status})` };
+    }
+    return { ok: true };
+  } catch {
+    return { ok: false, reason: 'api_error', message: '无法连接云端 API' };
+  }
+}
+
 /** 错题思维交流：第一步 AI 输出 */
 export type ReflectionAnalyzeResponse = {
   blindSpots: string[];
@@ -122,6 +161,12 @@ export type MistakeRow = {
   reflection_text?: string | null;
   reflection_session?: unknown;
 };
+
+export type MistakeDetail = MistakeRow;
+
+export async function fetchMistakeDetail(id: number): Promise<MistakeDetail> {
+  return apiFetch<MistakeDetail>(`/api/mistakes/${id}`);
+}
 
 export type GraphPayload = {
   nodes: { id: string; label: string; count: number }[];
