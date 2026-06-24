@@ -111,10 +111,8 @@ function isGarbledBetweenOptions(line: string): boolean {
   const t = line.trim();
   if (!t || /^[A-Da-d][.、．]/.test(t)) return false;
   if (/^!\[/.test(t) || /^\(第\d+题\)$/.test(t)) return false;
-  return (
-    /往往.*重力.*影响|减小.*(?:自己|自身).*重力/.test(t) ||
-    (/[\u4e00-\u9fff]{8,}/.test(t) && /才能|找到|重要/.test(t))
-  );
+  // 仅匹配已知的 OCR 误识碎片，避免误删含「才能」的正常题干
+  return /往往.*(?:重力|影响)|减小.*(?:自己|自身).*重力.*影响/.test(t);
 }
 
 /** 二力平衡 + 10g 卡片：补全 A/B 并修正 B=50g */
@@ -141,11 +139,7 @@ function supplementTwoForceBalanceOptions(text: string): string {
     if (m) letters.add(m[1].toUpperCase());
   }
 
-  const hasC = letters.has('C');
-  const hasD = letters.has('D');
-  if (!hasC || !hasD) return result;
-
-  result = result.replace(/^B\.\s*50\s*g\s*$/gim, 'B. 10g');
+  if (!letters.has('C') || !letters.has('D')) return result;
 
   if (!letters.has('A') || !letters.has('B')) {
     result = result.replace(/^(\s*C\.\s*200\s*g)/im, 'A. 5g\n\nB. 10g\n\n$1');
