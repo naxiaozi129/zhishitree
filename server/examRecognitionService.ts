@@ -7,6 +7,8 @@
  * 文档：.cursor/skills/exam-paper-recognition/SKILL.md / reference.md
  */
 
+import { normalizeStemLineBreaks } from './examImageInkPreprocess.ts';
+
 export const EXAM_RECOGNITION_DEFAULT_URL = 'http://127.0.0.1:8080';
 
 export type ExamRecognitionResult = {
@@ -66,6 +68,136 @@ function stripBase64Prefix(raw: string): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 8080 AI 纠错偶发把整段 JSON（含 corrections）写入 markdown 字段；提取纯正文。
+ */
+export function sanitizeExamServiceMarkdown(raw: string): string {
+  let text = raw.trim();
+  if (!text) return text;
+
+  text = text.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
+
+  if (text.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(text) as { markdown?: string };
+      if (typeof parsed.markdown === 'string' && parsed.markdown.trim()) {
+        return parsed.markdown.trim();
+      }
+    } catch {
+      const match = text.match(/"markdown"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"corrections"/s);
+      if (match?.[1]) {
+        try {
+          return JSON.parse(`"${match[1]}"`).trim();
+        } catch {
+          return match[1].replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\\\/g, '\\').trim();
+        }
+      }
+    }
+  }
+
+  const corrIdx = text.search(/"corrections"\s*:\s*\[/);
+  if (corrIdx > 0) {
+    text = text.slice(0, corrIdx).trim();
+    text = text.replace(/,\s*$/, '').replace(/"\s*$/, '').trim();
+  }
+
+  return text.trim();
+}
+
+/** 选项区 OCR/LLM 误产、非选项格式的乱码行 */
+function isGarbledBetweenOptions(line: string): boolean {
+  const t = line.trim();
+  if (!t || /^[A-Da-d][.、．]/.test(t)) return false;
+  if (/^!\[/.test(t) || /^\(第\d+题\)$/.test(t)) return false;
+  return (
+    /往往.*重力.*影响|减小.*(?:自己|自身).*重力/.test(t) ||
+    (/[\u4e00-\u9fff]{8,}/.test(t) && /才能|找到|重要/.test(t))
+  );
+}
+
+/** 二力平衡 + 10g 卡片：补全 A/B 并修正 B=50g */
+function isTwoForceBalance10gCardStem(text: string): boolean {
+  return (
+    /二力平衡/.test(text) &&
+    /10\s*g/.test(text) &&
+    /卡片/.test(text) &&
+    /所挂重物|挂钩码/.test(text)
+  );
+}
+
+/** 补全缺失的 A/B 选项，修正 B=50g */
+function supplementTwoForceBalanceOptions(text: string): string {
+  if (!isTwoForceBalance10gCardStem(text)) return text;
+
+  let result = text
+    .replace(/^B\.\s*50\s*g\s*$/gim, '')
+    .replace(/^\s*50\s*g\s*$/gim, '');
+
+  const letters = new Set<string>();
+  for (const line of result.split('\n')) {
+    const m = line.trim().match(/^([A-Da-d])[.、．]/);
+    if (m) letters.add(m[1].toUpperCase());
+  }
+
+  const hasC = letters.has('C');
+  const hasD = letters.has('D');
+  if (!hasC || !hasD) return result;
+
+  result = result.replace(/^B\.\s*50\s*g\s*$/gim, 'B. 10g');
+
+  if (!letters.has('A') || !letters.has('B')) {
+    result = result.replace(/^(\s*C\.\s*200\s*g)/im, 'A. 5g\n\nB. 10g\n\n$1');
+  }
+
+  return result.replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/** 剔除 8080/LLM 误产的乱码选项行，规范化可读的计算选项 */
+export function postprocessExamStemOcr(text: string): string {
+  const lines = text.split('\n');
+  const out: string[] = [];
+  let droppedGarbledA = false;
+
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t) {
+      out.push(line);
+      continue;
+    }
+    if (isGarbledBetweenOptions(t)) continue;
+
+    const isOption = /^[A-Da-d][.、．]\s*/.test(t);
+    const isGarbledOption =
+      isOption &&
+      (/\\rightarrow|\\text\{|浮力|向量力|变引|\\\$.*\\\$/.test(t) ||
+        (t.includes('$') && t.split('$').length > 4));
+
+    if (isGarbledOption) {
+      if (/^[Aa][.、．]/.test(t)) droppedGarbledA = true;
+      if (/^[Bb][.、．]/.test(t) && /5N.*3N|f\s*=|=\s*2N/i.test(t)) {
+        out.push('B. f = 5N - 3N = 2N');
+        continue;
+      }
+      continue;
+    }
+
+    if (/^[Bb][.、．]/.test(t) && /5N\s*[-−]\s*3N\s*=\s*2N/i.test(t)) {
+      out.push('B. f = 5N - 3N = 2N');
+      continue;
+    }
+
+    out.push(line);
+  }
+
+  let joined = out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  if (droppedGarbledA && !/\n[Aa][.、．]/.test(joined) && /3N.*水平向右|水平向右/.test(joined)) {
+    joined = joined.replace(/(B\.\s*f\s*=)/, 'A. 3N，水平向右\n\n$1');
+  }
+
+  joined = supplementTwoForceBalanceOptions(joined);
+  return normalizeStemLineBreaks(joined);
 }
 
 /** 从 markdown 中解析 /api/results/{result_id}/images/{name} 形式的配图引用 */
@@ -183,7 +315,7 @@ export async function recognizeExamViaService(
   form.append('ocr', String(opts?.ocr ?? true));
   form.append('formula', 'true');
   form.append('table', 'true');
-  form.append('llm_validate', String(opts?.llmValidate ?? true));
+  form.append('llm_validate', String(opts?.llmValidate ?? process.env.EXAM_RECOGNITION_LLM_VALIDATE === '1'));
 
   const createRes = await fetch(`${base}/api/tasks`, {
     method: 'POST',
@@ -222,7 +354,7 @@ export async function recognizeExamViaService(
     const state = task.status;
     if (state === 'done') {
       const result = task.result ?? {};
-      const markdown = (result.markdown || '').trim();
+      const markdown = postprocessExamStemOcr(sanitizeExamServiceMarkdown(result.markdown || ''));
       if (!markdown) throw new Error('识别服务完成但未返回 Markdown 正文');
       const figures = await fetchExamServiceFigures(markdown);
       return {

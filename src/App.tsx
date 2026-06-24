@@ -536,10 +536,33 @@ export default function App() {
                         <Target size={20} className="text-amber-500 shrink-0" />
                         错因定位
                       </h3>
-                      <p className="text-sm text-amber-900/80 mt-1">重点看「错在哪、为什么错」，支持 Markdown 与公式</p>
+                      <p className="text-sm text-amber-900/80 mt-1">
+                        {(analysis.originalAnswer?.trim() || analysis.correctedAnswer?.trim())
+                          ? '结合上方手写作答，分析可能错因'
+                          : '重点看「错在哪、为什么错」，支持 Markdown 与公式'}
+                      </p>
                     </div>
-                    <div className="p-5 md:p-7 text-slate-800">
-                      <MarkdownRenderer content={analysis.specificMistake} density="relaxed" />
+                    <div className="p-5 md:p-7 text-slate-800 space-y-4">
+                      {(analysis.originalAnswer?.trim() || analysis.correctedAnswer?.trim()) ? (
+                        <div className="grid gap-3 sm:grid-cols-2 rounded-xl border border-amber-100 bg-amber-50/40 p-4 text-sm">
+                          <div className="min-w-0">
+                            <span className="text-xs font-medium text-amber-900/70">原始作答</span>
+                            <p className="mt-1 font-medium text-slate-800 break-words">
+                              {analysis.originalAnswer?.trim() || '—'}
+                            </p>
+                          </div>
+                          <div className="min-w-0">
+                            <span className="text-xs font-medium text-rose-700/80">批改答案</span>
+                            <p className="mt-1 font-medium text-rose-900 break-words">
+                              {analysis.correctedAnswer?.trim() || '—'}
+                            </p>
+                          </div>
+                        </div>
+                      ) : null}
+                      <div>
+                        <p className="text-sm font-semibold text-amber-900 mb-3">可能的原因</p>
+                        <MarkdownRenderer content={analysis.specificMistake} density="relaxed" />
+                      </div>
                     </div>
                   </div>
 

@@ -51,12 +51,22 @@ export async function analyzeStudentReflection(
     analysis: Record<string, unknown>;
     reflectionText: string;
     scienceContext: string;
+    studentSelectedCauses?: string[];
+    otherCause?: string;
   },
   modelId?: string,
   aiConfig?: Partial<ResolvedAiConfig>,
 ): Promise<ReflectionAnalyzeResult> {
   const cfg = buildCfg(apiKey, modelId, aiConfig);
   const payload = compactAnalysisForPrompt(params.analysis);
+  const causeBlock =
+    params.studentSelectedCauses?.length || params.otherCause?.trim()
+      ? `
+
+【学生勾选的错因（系统 AI 推测项）】
+${params.studentSelectedCauses?.length ? params.studentSelectedCauses.map((c, i) => `${i + 1}. ${c}`).join('\n') : '（未勾选）'}
+${params.otherCause?.trim() ? `\n【学生补充自述错因】\n${params.otherCause.trim()}` : ''}`
+      : '';
   const prompt = `你是经验丰富的中学教研员。根据题目侧的 AI 解析要点、（若有）课纲知识点命中，以及学生自述「为什么选错、当时怎么想的」，完成下列任务。全程使用简体中文。
 
 【题目侧解析摘要】
@@ -64,6 +74,7 @@ ${JSON.stringify(payload, null, 0)}
 
 【与本校初中科学知识树相关的命中节点（可为空）】
 ${params.scienceContext.trim() || '（无）'}
+${causeBlock}
 
 【学生自述】
 ${params.reflectionText}

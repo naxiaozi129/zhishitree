@@ -43,6 +43,8 @@ export type MistakeReflectionSession = {
   followUpAnswers?: string[];
   similarAnswers?: string[];
   assessResult?: ReflectionAssessResponse;
+  selectedCauseIndices?: number[];
+  otherCause?: string;
 };
 
 export type RestoredMistakeSession = {
@@ -55,6 +57,8 @@ export type RestoredMistakeSession = {
   followUpAnswers: string[];
   similarAnswers: string[];
   reflectionAssessResult: ReflectionAssessResponse | null;
+  selectedCauseIndices: number[];
+  otherCause: string;
 };
 
 /** 从云端错题记录恢复错题录入页的完整状态（不重新调用分析 API） */
@@ -81,14 +85,22 @@ export function restoreMistakeSession(row: MistakeRow): RestoredMistakeSession |
 
   if (session?.analyzeResult) {
     reflectionAnalyzeResult = session.analyzeResult;
-    followUpAnswers =
-      session.followUpAnswers ?? session.analyzeResult.followUpQuestions.map(() => '');
-    similarAnswers =
-      session.similarAnswers ?? session.analyzeResult.similarQuestions.map(() => '');
+    const fuLen = session.analyzeResult.followUpQuestions.length;
+    const simLen = session.analyzeResult.similarQuestions.length;
+    followUpAnswers = Array.from({ length: fuLen }, (_, i) => session.followUpAnswers?.[i] ?? '');
+    similarAnswers = Array.from({ length: simLen }, (_, i) => session.similarAnswers?.[i] ?? '');
+  } else if (session?.followUpAnswers?.length || session?.similarAnswers?.length) {
+    followUpAnswers = session.followUpAnswers ?? [];
+    similarAnswers = session.similarAnswers ?? [];
   }
   if (session?.assessResult) {
     reflectionAssessResult = session.assessResult;
   }
+
+  const selectedCauseIndices = Array.isArray(session?.selectedCauseIndices)
+    ? session.selectedCauseIndices.filter((n): n is number => Number.isInteger(n) && n >= 0)
+    : [];
+  const otherCause = typeof session?.otherCause === 'string' ? session.otherCause : '';
 
   return {
     mistakeId: row.id,
@@ -100,5 +112,7 @@ export function restoreMistakeSession(row: MistakeRow): RestoredMistakeSession |
     followUpAnswers,
     similarAnswers,
     reflectionAssessResult,
+    selectedCauseIndices,
+    otherCause,
   };
 }

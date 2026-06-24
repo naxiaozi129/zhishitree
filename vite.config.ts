@@ -38,6 +38,9 @@ export default defineConfig(({ mode }) => {
             env.VITE_API_PROXY_TARGET ||
             `http://127.0.0.1:${env.API_PORT || env.PORT || 8790}`,
           changeOrigin: true,
+          // 8080 识别 + 手写提取可达数分钟，避免代理先断连返回 HTTP 500
+          timeout: 600_000,
+          proxyTimeout: 600_000,
         },
       },
     },
@@ -50,6 +53,9 @@ export default defineConfig(({ mode }) => {
             env.VITE_API_PROXY_TARGET ||
             `http://127.0.0.1:${env.API_PORT || env.PORT || 8790}`,
           changeOrigin: true,
+          // 8080 识别 + 手写提取可达数分钟，避免代理先断连返回 HTTP 500
+          timeout: 600_000,
+          proxyTimeout: 600_000,
         },
       },
     },

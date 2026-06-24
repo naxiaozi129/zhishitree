@@ -168,6 +168,44 @@ export async function fetchMistakeDetail(id: number): Promise<MistakeDetail> {
   return apiFetch<MistakeDetail>(`/api/mistakes/${id}`);
 }
 
+export type SaveReflectionProgressResult =
+  | { ok: true }
+  | { ok: false; reason: 'not_logged_in' | 'not_found' | 'api_error'; message: string };
+
+/** 保存思维交流过程（不触发 AI），用于自动保存与后期编辑 */
+export async function saveReflectionProgressIfAuthed(
+  id: number,
+  payload: {
+    reflectionText?: string;
+    followUpAnswers?: string[];
+    similarAnswers?: string[];
+    selectedCauseIndices?: number[];
+    otherCause?: string;
+  },
+): Promise<SaveReflectionProgressResult> {
+  try {
+    const r = await fetch(`/api/mistakes/${id}/reflection`, {
+      method: 'PATCH',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await parseResponseJson<{ ok?: boolean; error?: string }>(r);
+    if (r.status === 401) {
+      return { ok: false, reason: 'not_logged_in', message: '未登录' };
+    }
+    if (r.status === 404) {
+      return { ok: false, reason: 'not_found', message: '错题记录不存在' };
+    }
+    if (!r.ok) {
+      return { ok: false, reason: 'api_error', message: data.error || `保存失败 (${r.status})` };
+    }
+    return { ok: true };
+  } catch {
+    return { ok: false, reason: 'api_error', message: '无法连接云端 API' };
+  }
+}
+
 export type GraphPayload = {
   nodes: { id: string; label: string; count: number }[];
   edges: { source: string; target: string; weight: number }[];

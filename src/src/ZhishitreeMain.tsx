@@ -19,7 +19,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import * as htmlToImage from 'html-to-image';
-import { analyzeRecognizedQuestion, explainKnowledgePoint, QuestionAnalysis, KnowledgePointDetails, resolveAnalysisImageUri, resolveCircuitImageUri, figureDataUriIfValid, isValidFigureData, recognizeQuestionImage, fetchExamServiceHealth, type OcrEngine, type ExamServiceHealth, type QuestionRecognitionResult } from './services/geminiService';
+import { analyzeRecognizedQuestion, explainKnowledgePoint, QuestionAnalysis, KnowledgePointDetails, resolveAnalysisImageUri, figureDataUriIfValid, isValidFigureData, recognizeQuestionImage, fetchExamServiceHealth, type OcrEngine, type ExamServiceHealth, type QuestionRecognitionResult, type OcrContentLayout } from './services/geminiService';
 import { EditableRecognizedExamText } from './components/EditableRecognizedExamText';
 import { EditableOriginalAnswer } from './components/EditableOriginalAnswer';
 import { formatMcqOptionsPerLine } from './utils/formatExamDisplay';
@@ -38,69 +38,17 @@ import {
   fetchMistakeDetail,
   saveMistakeIfAuthed,
   updateMistakeIfAuthed,
+  saveReflectionProgressIfAuthed,
   type ReflectionAnalyzeResponse,
   type ReflectionAssessResponse,
 } from './services/api';
 import { restoreMistakeSession } from './components/mistakeDisplay';
+import { SummaryPointsList } from './components/SummaryPointsList';
+import { MistakeCauseSelector } from './components/MistakeCauseSelector';
+import { QuestionOriginalPanel } from './components/QuestionOriginalPanel';
+import { prepareOcrMarkdown } from './utils/examMarkdownPreview';
 
 const KNOWLEDGE_TREE_VERSION = 'junior-science-v1';
-
-/** 将模型返回的长段文字拆成多条要点，便于分条展示 */
-function splitIntoKeyPoints(text: string): string[] {
-  const raw = text.trim();
-  if (!raw) return [];
-  let parts = raw
-    .split(/\r?\n+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-  if (parts.length === 1) {
-    const semi = parts[0].split(/[；;]\s+/).map((s) => s.trim()).filter(Boolean);
-    if (semi.length > 1) parts = semi;
-  }
-  return parts
-    .map((p) =>
-      p
-        .replace(/^(\d{1,2}|[一二三四五六七八九十]{1,3})[、.．]\s*/u, '')
-        .replace(/^\d+\.\s*/, '')
-        .replace(/^[•\-*]\s*/, '')
-        .trim(),
-    )
-    .filter(Boolean);
-}
-
-function prepareOcrMarkdown(
-  content: string,
-  analysis: QuestionAnalysis | null,
-  fallbackImage?: string | null,
-): string {
-  let md = formatMcqOptionsPerLine(content);
-  const circuitUri = resolveCircuitImageUri(analysis, fallbackImage);
-  const fullUri = resolveAnalysisImageUri(analysis, fallbackImage);
-  const fallbackUri = circuitUri ?? fullUri;
-
-  if (fallbackUri) {
-    md = md.replace(
-      /!\[([^\]]*)\]\(fig-circuit\)/g,
-      (_full, alt) => `![${alt || '电路图'}](${circuitUri ?? fallbackUri})`,
-    );
-    md = md.replace(
-      /!\[([^\]]*)\]\(fig-main\)/g,
-      (_full, alt) => `![${alt || '原题配图'}](${fullUri ?? fallbackUri})`,
-    );
-    md = md.replace(/\[电路图见原题配图\]/g, `![电路图](${circuitUri ?? fallbackUri})`);
-    // MinerU 相对路径或未嵌入的配图引用
-    md = md.replace(/!\[([^\]]*)\]\((?!data:|https?:|fig-)([^)]+)\)/g, (_full, alt) => {
-      return `![${alt || '配图'}](${circuitUri ?? fallbackUri})`;
-    });
-    // 修复 localStorage 截断或空 base64 导致的裂图
-    md = md.replace(/!\[([^\]]*)\]\(data:[^)]*\)/g, (full, alt) => {
-      const m = full.match(/base64,([^)]+)/);
-      if (!m || m[1].trim().length < 64) return `![${alt || '配图'}](${fallbackUri})`;
-      return full;
-    });
-  }
-  return md.trim();
-}
 
 /** 写入 localStorage 时去掉大图二进制，避免配额溢出与 JSON 截断 */
 function slimAnalysisForStorage(analysis: QuestionAnalysis): QuestionAnalysis {
@@ -108,13 +56,19 @@ function slimAnalysisForStorage(analysis: QuestionAnalysis): QuestionAnalysis {
     /!\[([^\]]*)\]\(data:[^)]+\)/g,
     '![$1](fig-circuit)',
   );
+  const slimFigures = analysis.figures?.map((f) => {
+    if (f.id === 'fig-circuit' && isValidFigureData(f.data)) {
+      return f;
+    }
+    return { ...f, data: '' };
+  });
   return {
     ...analysis,
     rawOcrText,
     sourceImage: analysis.sourceImage
       ? { mime: analysis.sourceImage.mime, data: '' }
       : undefined,
-    figures: analysis.figures?.map((f) => ({ ...f, data: '' })),
+    figures: slimFigures,
   };
 }
 
@@ -189,6 +143,10 @@ export function ZhishitreeMain({
   const [followUpAnswers, setFollowUpAnswers] = useState<string[]>([]);
   const [similarAnswers, setSimilarAnswers] = useState<string[]>([]);
   const [reflectionAssessResult, setReflectionAssessResult] = useState<ReflectionAssessResponse | null>(null);
+  const [selectedCauseIndices, setSelectedCauseIndices] = useState<number[]>([]);
+  const [otherCause, setOtherCause] = useState('');
+  const [reflectionSaveState, setReflectionSaveState] = useState<'idle' | 'pending' | 'saving' | 'saved' | 'error'>('idle');
+  const reflectionSkipAutosaveRef = useRef(true);
   const [cloudSaveHint, setCloudSaveHint] = useState<string | null>(null);
   const [cloudSaveBusy, setCloudSaveBusy] = useState(false);
   const [ocrEditSaving, setOcrEditSaving] = useState(false);
@@ -205,6 +163,58 @@ export function ZhishitreeMain({
   });
 
   const hasApiKey = Boolean(String(process.env.GEMINI_API_KEY ?? '').trim());
+
+  const persistReflectionProgress = useCallback(
+    async (opts?: { silent?: boolean }) => {
+      if (!reflectionMistakeId) return false;
+      if (!opts?.silent) setReflectionSaveState('saving');
+      const result = await saveReflectionProgressIfAuthed(reflectionMistakeId, {
+        reflectionText: studentReflection,
+        followUpAnswers,
+        similarAnswers,
+        selectedCauseIndices,
+        otherCause,
+      });
+      if (result.ok) {
+        if (!opts?.silent) setReflectionSaveState('saved');
+        return true;
+      }
+      if (!opts?.silent) setReflectionSaveState('error');
+      return false;
+    },
+    [reflectionMistakeId, studentReflection, followUpAnswers, similarAnswers, selectedCauseIndices, otherCause],
+  );
+
+  const causeSaveHint = (() => {
+    if (!user) return '可先勾选，登录并保存到错题本后同步云端';
+    if (!reflectionMistakeId) return '请先保存到错题本以记录选择';
+    if (reflectionSaveState === 'saved') return '已自动保存';
+    if (reflectionSaveState === 'error') return '保存失败';
+    if (reflectionSaveState === 'pending' || reflectionSaveState === 'saving') return '保存中…';
+    return null;
+  })();
+
+  useEffect(() => {
+    if (!reflectionMistakeId || !user) return;
+    if (reflectionSkipAutosaveRef.current) return;
+
+    setReflectionSaveState('pending');
+    const timer = window.setTimeout(() => {
+      void persistReflectionProgress({ silent: true }).then((ok) => {
+        setReflectionSaveState(ok ? 'saved' : 'error');
+      });
+    }, 1000);
+    return () => window.clearTimeout(timer);
+  }, [
+    reflectionMistakeId,
+    user,
+    studentReflection,
+    followUpAnswers,
+    similarAnswers,
+    selectedCauseIndices,
+    otherCause,
+    persistReflectionProgress,
+  ]);
 
   // Save state to localStorage whenever it changes
   useEffect(() => {
@@ -299,6 +309,20 @@ export function ZhishitreeMain({
         setFollowUpAnswers(restored.followUpAnswers);
         setSimilarAnswers(restored.similarAnswers);
         setReflectionAssessResult(restored.reflectionAssessResult);
+        setSelectedCauseIndices(restored.selectedCauseIndices);
+        setOtherCause(restored.otherCause);
+        reflectionSkipAutosaveRef.current = true;
+        window.setTimeout(() => {
+          reflectionSkipAutosaveRef.current = false;
+          setReflectionSaveState(
+            restored.studentReflection ||
+              restored.reflectionAnalyzeResult ||
+              restored.selectedCauseIndices.length > 0 ||
+              restored.otherCause.trim()
+              ? 'saved'
+              : 'idle',
+          );
+        }, 0);
         setSelectedPoint(null);
         setPointDetails(null);
         setCloudSaveHint(null);
@@ -325,6 +349,8 @@ export function ZhishitreeMain({
     setReflectionAssessResult(null);
     setFollowUpAnswers([]);
     setSimilarAnswers([]);
+    setSelectedCauseIndices([]);
+    setOtherCause('');
   }, []);
 
   const clearMistakeRoute = useCallback(() => {
@@ -410,16 +436,22 @@ export function ZhishitreeMain({
         mimeType,
         recognitionResult,
       );
-      setAnalysis(result);
+      setAnalysis({
+        ...result,
+        ocrLayout: recognitionResult.ocrLayout ?? result.ocrLayout,
+      });
       setStudentReflection('');
       setReflectionAnalyzeResult(null);
       setReflectionAssessResult(null);
       setFollowUpAnswers([]);
       setSimilarAnswers([]);
+      reflectionSkipAutosaveRef.current = true;
+      setReflectionSaveState('idle');
       const saved = await saveMistakeIfAuthed(analysisForCloudSave(result, image, mimeType));
       if (saved.ok) {
         setReflectionMistakeId(saved.id);
         setCloudSaveHint(null);
+        reflectionSkipAutosaveRef.current = false;
       } else {
         setReflectionMistakeId(null);
         setCloudSaveHint(saved.ok === false ? saved.message : '同步云端失败');
@@ -456,6 +488,11 @@ export function ZhishitreeMain({
       setFollowUpAnswers(data.followUpQuestions.map(() => ''));
       setSimilarAnswers(data.similarQuestions.map(() => ''));
       setReflectionAssessResult(null);
+      reflectionSkipAutosaveRef.current = true;
+      setReflectionSaveState('saved');
+      window.setTimeout(() => {
+        reflectionSkipAutosaveRef.current = false;
+      }, 0);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : '思维交流分析失败');
     } finally {
@@ -476,6 +513,11 @@ export function ZhishitreeMain({
         },
       );
       setReflectionAssessResult(data);
+      reflectionSkipAutosaveRef.current = true;
+      setReflectionSaveState('saved');
+      window.setTimeout(() => {
+        reflectionSkipAutosaveRef.current = false;
+      }, 0);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : '评估失败');
     } finally {
@@ -490,6 +532,7 @@ export function ZhishitreeMain({
       if (updated.ok) {
         setReflectionMistakeId(existingId);
         setCloudSaveHint(null);
+        reflectionSkipAutosaveRef.current = false;
         return true;
       }
       setCloudSaveHint(updated.ok === false ? updated.message : '更新失败');
@@ -499,6 +542,7 @@ export function ZhishitreeMain({
     if (saved.ok) {
       setReflectionMistakeId(saved.id);
       setCloudSaveHint(null);
+      reflectionSkipAutosaveRef.current = false;
       return true;
     }
     setCloudSaveHint(saved.ok === false ? saved.message : '保存失败');
@@ -559,6 +603,27 @@ export function ZhishitreeMain({
     }
     if (recognitionResult) {
       setRecognitionResult({ ...recognitionResult, originalAnswer: trimmed || undefined });
+    }
+  };
+
+  const handleOcrLayoutSave = async (layout: OcrContentLayout) => {
+    if (analysis) {
+      const nextAnalysis: QuestionAnalysis = { ...analysis, ocrLayout: layout };
+      setAnalysis(nextAnalysis);
+      if (!user || !canUseApp(user)) return;
+      setOcrEditSaving(true);
+      try {
+        const ok = await persistAnalysisToCloud(analysisForCloudSave(nextAnalysis, image, mimeType));
+        if (!ok) {
+          setError('排版已更新，但同步云端失败，可点击「重试同步到云端错题本」。');
+        }
+      } finally {
+        setOcrEditSaving(false);
+      }
+      return;
+    }
+    if (recognitionResult) {
+      setRecognitionResult({ ...recognitionResult, ocrLayout: layout });
     }
   };
 
@@ -717,6 +782,7 @@ export function ZhishitreeMain({
           figures: recognitionResult.figures,
           circuitDescription: recognitionResult.circuitDescription,
           ocrMeta: recognitionResult.ocrMeta,
+          ocrLayout: recognitionResult.ocrLayout,
         }
       : null);
 
@@ -1128,7 +1194,7 @@ export function ZhishitreeMain({
                   <div className="px-4 py-3 border-b border-emerald-100 bg-emerald-50/40 border-l-4 border-l-emerald-500">
                     <h2 className="text-lg font-bold text-slate-800">识别结果</h2>
                     <p className="text-xs text-slate-500 mt-0.5">
-                      环节 ②：核对黑色原始作答与红色批改答案、识别文本，可直接编辑；确认后点击左侧「开始考点分析」
+                      环节 ②：先核对识别文本，再核对黑色原始作答与红色批改答案；可直接编辑，确认后点击左侧「开始考点分析」
                     </p>
                     {ocrPreviewAnalysis.ocrMeta ? (
                       <p className="mt-1 text-[11px] text-emerald-700">
@@ -1140,6 +1206,16 @@ export function ZhishitreeMain({
                     ) : null}
                   </div>
                   <div className="p-4 min-w-0 space-y-4">
+                    <EditableRecognizedExamText
+                      rawText={ocrPreviewAnalysis.rawOcrText}
+                      previewMarkdown={prepareOcrMarkdown(ocrPreviewAnalysis.rawOcrText, ocrPreviewAnalysis, image)}
+                      onSave={handleOcrTextSave}
+                      ocrLayout={ocrPreviewAnalysis.ocrLayout}
+                      onLayoutSave={handleOcrLayoutSave}
+                      saving={ocrEditSaving}
+                      className="recognized-exam-preview min-w-0"
+                      sourceImageUri={resolveAnalysisImageUri(ocrPreviewAnalysis, image)}
+                    />
                     <div className="grid gap-3 sm:grid-cols-2">
                       <EditableOriginalAnswer
                         kind="original"
@@ -1154,13 +1230,6 @@ export function ZhishitreeMain({
                         saving={ocrEditSaving}
                       />
                     </div>
-                    <EditableRecognizedExamText
-                      rawText={ocrPreviewAnalysis.rawOcrText}
-                      previewMarkdown={prepareOcrMarkdown(ocrPreviewAnalysis.rawOcrText, ocrPreviewAnalysis, image)}
-                      onSave={handleOcrTextSave}
-                      saving={ocrEditSaving}
-                      className="recognized-exam-preview min-w-0"
-                    />
                   </div>
                 </div>
               )}
@@ -1212,168 +1281,110 @@ export function ZhishitreeMain({
                   <div ref={analysisRef} className="grid gap-4 xl:grid-cols-2 2xl:grid-cols-3">
                     {/* ① OCR + 原题配图 — 通栏，题图与文字左右分栏 */}
                     {(analysis.rawOcrText || resolveAnalysisImageUri(analysis, image)) && (
-                      <div className="xl:col-span-2 2xl:col-span-3 bg-white rounded-xl shadow-sm border border-slate-200 border-l-[4px] border-l-slate-400 overflow-hidden">
-                        <div className="px-4 py-2.5 border-b border-slate-100 bg-slate-50/60">
-                          <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">① 题目原文</p>
-                          <h3 className="text-base font-bold text-slate-900 mt-0.5 flex items-center gap-2">
-                            <BookOpen size={17} className="text-slate-500 shrink-0" />
-                            识别文本 · 表格 · 配图
-                          </h3>
+                      <div className="xl:col-span-2 2xl:col-span-3 bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden">
+                        <div className="px-3 py-2 border-b border-slate-100 flex items-center gap-2">
+                          <BookOpen size={14} className="text-slate-500 shrink-0" />
+                          <h3 className="text-sm font-semibold text-slate-800">题目原文</h3>
                         </div>
-                        <div className="p-4 grid gap-4 lg:grid-cols-[minmax(200px,34%)_1fr] lg:items-start">
-                          <div className="space-y-3">
-                          {(() => {
-                            const circuitFig =
-                              analysis?.figures?.find((f) => f.id === 'fig-circuit') ??
-                              analysis?.figures?.find((f) => /电路/.test(f.label));
-                            const circuitUri = resolveCircuitImageUri(analysis, image);
-                            const fullUri = resolveAnalysisImageUri(analysis, image);
-                            const sourceMime = analysis.sourceImage?.mime || mimeType;
-                            return (
+                        <div className="p-3">
+                          <QuestionOriginalPanel
+                            analysis={analysis}
+                            fallbackImage={image}
+                            mimeType={mimeType}
+                            uploadFileName={uploadFileName}
+                          >
+                            {({ previewMaxHeightPx }) => (
                               <>
-                                {circuitUri ? (
-                                  <div className="rounded-lg border border-emerald-200 bg-emerald-50/40 p-2">
-                                    <p className="text-[11px] font-medium text-emerald-800 mb-1.5">电路图 / 题图</p>
-                                    <QuestionSourceMedia
-                                      uri={circuitUri}
-                                      mime={circuitFig?.mime}
-                                      alt="电路图"
-                                      className="max-h-[min(280px,40vh)] w-full object-contain rounded-md bg-white"
-                                      embedClassName="w-full max-h-[min(280px,40vh)] rounded-md bg-white"
-                                    />
-                                  </div>
+                                {analysis.circuitDescription?.trim() ? (
+                                  <p className="text-[12px] text-amber-900/90 rounded border border-amber-100 bg-amber-50/50 px-2 py-1.5 leading-snug">
+                                    <span className="font-medium">电路连接：</span>
+                                    {analysis.circuitDescription.trim()}
+                                  </p>
                                 ) : null}
-                                {fullUri && fullUri !== circuitUri ? (
-                                  <div className="rounded-lg border border-slate-200 bg-slate-50/80 p-2">
-                                    <p className="text-[11px] font-medium text-slate-500 mb-1.5">
-                                      {isPdfMime(sourceMime) ? '原题 PDF' : '原题完整截图'}
-                                    </p>
-                                    <QuestionSourceMedia
-                                      uri={fullUri}
-                                      mime={sourceMime}
-                                      fileName={uploadFileName}
-                                      alt="原题"
-                                      className="max-h-[min(220px,35vh)] w-full object-contain rounded-md bg-white"
-                                      embedClassName="w-full max-h-[min(220px,35vh)] rounded-md bg-white"
-                                    />
-                                  </div>
+                                {analysis.rawOcrText ? (
+                                  <EditableRecognizedExamText
+                                    rawText={analysis.rawOcrText}
+                                    previewMarkdown={prepareOcrMarkdown(analysis.rawOcrText, analysis, image)}
+                                    onSave={handleOcrTextSave}
+                                    ocrLayout={analysis.ocrLayout}
+                                    onLayoutSave={handleOcrLayoutSave}
+                                    saving={ocrEditSaving}
+                                    previewMaxHeightPx={previewMaxHeightPx}
+                                    sourceImageUri={resolveAnalysisImageUri(analysis, image)}
+                                  />
                                 ) : null}
+                                <div className="grid gap-2 sm:grid-cols-2">
+                                  <EditableOriginalAnswer
+                                    kind="original"
+                                    value={analysis.originalAnswer || ''}
+                                    onSave={handleOriginalAnswerSave}
+                                    saving={ocrEditSaving}
+                                  />
+                                  <EditableOriginalAnswer
+                                    kind="corrected"
+                                    value={analysis.correctedAnswer || ''}
+                                    onSave={handleCorrectedAnswerSave}
+                                    saving={ocrEditSaving}
+                                  />
+                                </div>
                               </>
-                            );
-                          })()}
-                          {analysis.figures
-                            ?.filter((fig) => {
-                              if (fig.id === 'fig-circuit') return false;
-                              if (!figureDataUriIfValid(fig)) return false;
-                              const topUri = resolveCircuitImageUri(analysis, image);
-                              const figUri = figureDataUriIfValid(fig);
-                              return !topUri || figUri !== topUri;
-                            })
-                            .map((fig) => (
-                            <div key={fig.id} className="rounded-lg border border-slate-200 bg-white p-2">
-                              <p className="text-[11px] font-medium text-slate-600 mb-1">{fig.label}</p>
-                              <img
-                                src={figureDataUriIfValid(fig)!}
-                                alt={fig.label}
-                                className="max-h-48 w-full object-contain rounded-md"
-                              />
-                            </div>
-                          ))}
-                          </div>
-                          <div className="space-y-3 min-h-0 min-w-0">
-                          {analysis.circuitDescription?.trim() ? (
-                            <div className="rounded-lg border border-amber-100 bg-amber-50/60 px-3 py-2 text-sm text-amber-950">
-                              <span className="font-semibold">电路连接：</span>
-                              {analysis.circuitDescription.trim()}
-                            </div>
-                          ) : null}
-                          <div className="grid gap-3 sm:grid-cols-2">
-                            <EditableOriginalAnswer
-                              kind="original"
-                              value={analysis.originalAnswer || ''}
-                              onSave={handleOriginalAnswerSave}
-                              saving={ocrEditSaving}
-                            />
-                            <EditableOriginalAnswer
-                              kind="corrected"
-                              value={analysis.correctedAnswer || ''}
-                              onSave={handleCorrectedAnswerSave}
-                              saving={ocrEditSaving}
-                            />
-                          </div>
-                          {analysis.rawOcrText ? (
-                            <EditableRecognizedExamText
-                              rawText={analysis.rawOcrText}
-                              previewMarkdown={prepareOcrMarkdown(analysis.rawOcrText, analysis, image)}
-                              onSave={handleOcrTextSave}
-                              saving={ocrEditSaving}
-                            />
-                          ) : null}
-                          </div>
+                            )}
+                          </QuestionOriginalPanel>
                         </div>
                       </div>
                     )}
 
                   {/* ② 题目摘要 */}
-                  <div className="bg-white rounded-xl shadow-sm border border-slate-200 border-l-[4px] border-l-indigo-500 overflow-hidden flex flex-col">
-                    <div className="px-4 py-2.5 border-b border-slate-100 bg-indigo-50/40 shrink-0">
-                      <p className="text-[10px] font-semibold uppercase tracking-wider text-indigo-600">② 题意速览</p>
-                      <h3 className="text-base font-bold text-slate-900 mt-0.5 flex items-center gap-2">
-                        <BookOpen size={17} className="text-indigo-500 shrink-0" />
+                  <div className="bg-white rounded-lg shadow-sm border border-slate-200 border-l-[3px] border-l-indigo-500 overflow-hidden flex flex-col">
+                    <div className="px-3 py-2 border-b border-slate-100 shrink-0">
+                      <h3 className="text-sm font-semibold text-slate-800 flex items-center gap-1.5">
+                        <BookOpen size={14} className="text-indigo-500 shrink-0" />
                         题目摘要
                       </h3>
                     </div>
-                    <div className="p-4 flex-1 overflow-y-auto max-h-[min(360px,45vh)]">
-                      <ul className="space-y-2.5">
-                        {splitIntoKeyPoints(formatMcqOptionsPerLine(analysis.summary)).map((point, idx) => (
-                          <li
-                            key={`summary-pt-${idx}`}
-                            className="flex gap-2.5 rounded-lg border border-indigo-100/80 bg-indigo-50/35 px-3 py-2.5"
-                          >
-                            <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-indigo-600 text-[11px] font-bold text-white">
-                              {idx + 1}
-                            </span>
-                            <p className="text-sm text-slate-800 leading-relaxed pt-0.5">{point}</p>
-                          </li>
-                        ))}
-                      </ul>
+                    <div className="px-3 py-2 flex-1 overflow-y-auto max-h-[min(280px,38vh)]">
+                      <SummaryPointsList summary={analysis.summary} />
                     </div>
                   </div>
 
                   {/* ③ 错因定位 */}
-                  <div className="bg-white rounded-xl shadow-sm border border-slate-200 border-l-[4px] border-l-amber-400 overflow-hidden flex flex-col">
-                    <div className="px-4 py-2.5 border-b border-amber-100/80 bg-amber-50/50 shrink-0">
-                      <p className="text-[10px] font-semibold uppercase tracking-wider text-amber-800">③ 错因拆解</p>
-                      <h3 className="text-base font-bold text-amber-950 mt-0.5 flex items-center gap-2">
-                        <Target size={17} className="text-amber-500 shrink-0" />
+                  <div className="bg-white rounded-lg shadow-sm border border-slate-200 border-l-[3px] border-l-amber-400 overflow-hidden flex flex-col">
+                    <div className="px-3 py-2 border-b border-slate-100 shrink-0">
+                      <h3 className="text-sm font-semibold text-slate-800 flex items-center gap-1.5">
+                        <Target size={14} className="text-amber-500 shrink-0" />
                         错因定位
                       </h3>
                     </div>
-                    <div className="p-4 flex-1 overflow-y-auto max-h-[min(360px,45vh)] text-slate-800">
-                      <MarkdownRenderer content={analysis.specificMistake} density="normal" />
+                    <div className="px-3 py-2 flex-1 overflow-y-auto max-h-[min(280px,38vh)] text-slate-800">
+                      <MistakeCauseSelector
+                        specificMistake={analysis.specificMistake}
+                        selectedIndices={selectedCauseIndices}
+                        onChange={setSelectedCauseIndices}
+                        otherCause={otherCause}
+                        onOtherCauseChange={setOtherCause}
+                        disabled={false}
+                        saveHint={causeSaveHint}
+                      />
                     </div>
                   </div>
 
                   {/* ④ 易错点 */}
-                  <div className="bg-white rounded-xl shadow-sm border border-slate-200 border-l-[4px] border-l-rose-400 overflow-hidden flex flex-col 2xl:col-span-1">
-                    <div className="px-4 py-2.5 border-b border-rose-100 bg-rose-50/40 shrink-0">
-                      <p className="text-[10px] font-semibold uppercase tracking-wider text-rose-800">④ 易错预警</p>
-                      <h3 className="text-base font-bold text-rose-950 mt-0.5 flex items-center gap-2">
-                        <AlertCircle size={17} className="text-rose-500 shrink-0" />
-                        易错点分析
+                  <div className="bg-white rounded-lg shadow-sm border border-slate-200 border-l-[3px] border-l-rose-400 overflow-hidden flex flex-col 2xl:col-span-1">
+                    <div className="px-3 py-2 border-b border-slate-100 shrink-0">
+                      <h3 className="text-sm font-semibold text-slate-800 flex items-center gap-1.5">
+                        <AlertCircle size={14} className="text-rose-500 shrink-0" />
+                        易错点
                       </h3>
                     </div>
-                    <div className="p-4 flex-1 overflow-y-auto max-h-[min(360px,45vh)]">
-                      <ul className="space-y-2.5">
+                    <div className="px-3 py-2 flex-1 overflow-y-auto max-h-[min(280px,38vh)]">
+                      <ul className="space-y-1.5">
                         {analysis.pitfalls.map((pitfall, idx) => (
                           <li
                             key={`pitfall-${idx}`}
-                            className="flex gap-2.5 rounded-lg border border-rose-100 bg-gradient-to-r from-rose-50/90 to-white px-3 py-2.5"
+                            className="flex gap-1.5 text-[13px] leading-snug text-slate-700"
                           >
-                            <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-rose-600 text-[11px] font-bold text-white">
-                              {idx + 1}
-                            </span>
-                            <p className="text-sm text-slate-800 leading-relaxed pt-0.5">{pitfall}</p>
+                            <span className="shrink-0 font-medium text-rose-500/70 tabular-nums">{idx + 1}.</span>
+                            <span className="min-w-0 break-words">{pitfall}</span>
                           </li>
                         ))}
                       </ul>
@@ -1492,11 +1503,43 @@ export function ZhishitreeMain({
                   {/* ⑥ 思维交流与盲区检测 — 通栏 */}
                   <div className="xl:col-span-2 2xl:col-span-3 overflow-hidden rounded-xl border border-slate-200 border-l-[4px] border-l-violet-500 bg-white shadow-sm">
                     <div className="border-b border-violet-100 bg-violet-50/50 px-4 py-2.5">
-                      <p className="text-[10px] font-semibold uppercase tracking-wider text-violet-800">⑥ 思维交流</p>
-                      <h3 className="mt-0.5 flex items-center gap-2 text-base font-bold text-violet-950">
-                        <MessageCircle size={17} className="shrink-0 text-violet-500" />
-                        自述错因 · AI 追问 · 相似题检验
-                      </h3>
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div>
+                          <p className="text-[10px] font-semibold uppercase tracking-wider text-violet-800">⑥ 思维交流</p>
+                          <h3 className="mt-0.5 flex items-center gap-2 text-base font-bold text-violet-950">
+                            <MessageCircle size={17} className="shrink-0 text-violet-500" />
+                            自述错因 · AI 追问 · 相似题检验
+                          </h3>
+                        </div>
+                        {reflectionMistakeId ? (
+                          <div className="flex items-center gap-2 text-xs text-slate-500">
+                            {reflectionSaveState === 'pending' || reflectionSaveState === 'saving' ? (
+                              <span className="inline-flex items-center gap-1 text-violet-600">
+                                <Loader2 size={12} className="animate-spin" />
+                                保存中…
+                              </span>
+                            ) : reflectionSaveState === 'saved' ? (
+                              <span className="text-emerald-600">已保存到云端</span>
+                            ) : reflectionSaveState === 'error' ? (
+                              <button
+                                type="button"
+                                onClick={() => void persistReflectionProgress()}
+                                className="text-rose-600 hover:underline"
+                              >
+                                保存失败 · 重试
+                              </button>
+                            ) : null}
+                            <button
+                              type="button"
+                              onClick={() => void persistReflectionProgress()}
+                              className="rounded-lg border border-violet-200 bg-white px-2.5 py-1 text-xs font-medium text-violet-800 hover:bg-violet-50"
+                            >
+                              保存记录
+                            </button>
+                          </div>
+                        ) : null}
+                      </div>
+                      <p className="mt-1 text-[11px] text-violet-800/70">编辑内容会自动同步，从错题本打开可继续填写</p>
                     </div>
                     <div className="space-y-5 p-4">
                       {!user ? (

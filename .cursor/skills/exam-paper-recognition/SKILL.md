@@ -3,6 +3,7 @@ name: exam-paper-recognition
 description: >-
   识别试卷/错题图片中的题干、选项、表格与配图。使用 MinerU VLM OCR + 试卷排版流水线（拆题、选项分行、题答分离）。
   在 zhishitree 错题上传、试卷导入、OCR 展示时自动适用。
+disable-model-invocation: true
 ---
 
 # 试卷 / 错题识别（exam-paper-recognition）

@@ -42,6 +42,7 @@ import {
   assessReflectionAnswers,
   type ReflectionAnalyzeResult,
 } from './mistakeReflectionGemini.js';
+import { resolveSelectedCauseLabels } from './mistakeAnalysisDisplay.js';
 import { splitExamPaperHeuristic, heuristicSplitLooksBroken, refineQuestionSplit } from './importPaper.js';
 import { stripExamBoilerplate } from './examBoilerplate.js';
 import { buildCooccurrenceGraph, type AnalysisShape } from './graph.js';
@@ -163,7 +164,7 @@ app.use(
     credentials: true,
   }),
 );
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '25mb' }));
 app.use(cookieParser());
 
 const paperUpload = multer({
@@ -553,8 +554,10 @@ app.post('/api/mistakes/:id/reflection/analyze', requireAuth, async (req, res, n
       return;
     }
     const row = db
-      .prepare('SELECT id, analysis_json FROM mistakes WHERE id = ? AND user_id = ?')
-      .get(id, req.user!.id) as { id: number; analysis_json: string } | undefined;
+      .prepare('SELECT id, analysis_json, reflection_session FROM mistakes WHERE id = ? AND user_id = ?')
+      .get(id, req.user!.id) as
+      | { id: number; analysis_json: string; reflection_session: string | null }
+      | undefined;
     if (!row) {
       res.status(404).json({ error: '记录不存在' });
       return;
@@ -566,6 +569,24 @@ app.post('/api/mistakes/:id/reflection/analyze', requireAuth, async (req, res, n
       res.status(400).json({ error: '错题解析数据损坏' });
       return;
     }
+
+    let priorSession: Record<string, unknown> = {};
+    if (row.reflection_session) {
+      try {
+        priorSession = JSON.parse(row.reflection_session) as Record<string, unknown>;
+      } catch {
+        priorSession = {};
+      }
+    }
+    const selectedCauseIndices = Array.isArray(priorSession.selectedCauseIndices)
+      ? priorSession.selectedCauseIndices
+          .map((x) => Number(x))
+          .filter((n) => Number.isInteger(n) && n >= 0)
+      : [];
+    const otherCause = typeof priorSession.otherCause === 'string' ? priorSession.otherCause : '';
+    const specificMistake = typeof analysis.specificMistake === 'string' ? analysis.specificMistake : '';
+    const studentSelectedCauses = resolveSelectedCauseLabels(specificMistake, selectedCauseIndices);
+
     const blob = analysisMatchBlob(analysis as AnalysisShape);
     const matches = matchAnalysisToScienceTree(analysis as AnalysisShape);
     const enriched = enrichMatchesWithReasons(blob, matches).filter((m) => m.score >= 28);
@@ -577,16 +598,23 @@ app.post('/api/mistakes/:id/reflection/analyze', requireAuth, async (req, res, n
         analysis,
         reflectionText,
         scienceContext,
+        studentSelectedCauses,
+        otherCause,
       },
       cfg.modelId,
       cfg,
     );
 
     const session = {
+      ...priorSession,
       v: 1 as const,
       reflectionText,
       analyzedAt: new Date().toISOString(),
       analyzeResult,
+      followUpAnswers: analyzeResult.followUpQuestions.map(() => ''),
+      similarAnswers: analyzeResult.similarQuestions.map(() => ''),
+      selectedCauseIndices,
+      otherCause,
     };
 
     db.prepare('UPDATE mistakes SET reflection_text = ?, reflection_session = ? WHERE id = ? AND user_id = ?').run(
@@ -683,6 +711,65 @@ app.post('/api/mistakes/:id/reflection/assess', requireAuth, async (req, res, ne
   } catch (e) {
     next(e);
   }
+});
+
+/**
+ * 保存思维交流过程（自述、追问作答、相似题作答），不重新调用 AI，便于后期编辑与恢复
+ * body: { reflectionText?, followUpAnswers?, similarAnswers?, selectedCauseIndices?, otherCause? }
+ */
+app.patch('/api/mistakes/:id/reflection', requireAuth, (req, res) => {
+  const id = Number(req.params.id);
+  const row = db
+    .prepare('SELECT reflection_text, reflection_session FROM mistakes WHERE id = ? AND user_id = ?')
+    .get(id, req.user!.id) as
+    | { reflection_text: string | null; reflection_session: string | null }
+    | undefined;
+  if (!row) {
+    res.status(404).json({ error: '记录不存在' });
+    return;
+  }
+
+  let session: Record<string, unknown> = { v: 1 };
+  if (row.reflection_session) {
+    try {
+      session = JSON.parse(row.reflection_session) as Record<string, unknown>;
+    } catch {
+      session = { v: 1 };
+    }
+  }
+
+  if (typeof req.body?.reflectionText === 'string') {
+    session.reflectionText = req.body.reflectionText;
+  }
+  if (Array.isArray(req.body?.followUpAnswers)) {
+    session.followUpAnswers = req.body.followUpAnswers.map((x: unknown) => String(x ?? ''));
+  }
+  if (Array.isArray(req.body?.similarAnswers)) {
+    session.similarAnswers = req.body.similarAnswers.map((x: unknown) => String(x ?? ''));
+  }
+  if (Array.isArray(req.body?.selectedCauseIndices)) {
+    session.selectedCauseIndices = req.body.selectedCauseIndices
+      .map((x: unknown) => Number(x))
+      .filter((n: number) => Number.isInteger(n) && n >= 0);
+  }
+  if (typeof req.body?.otherCause === 'string') {
+    session.otherCause = req.body.otherCause;
+  }
+  session.updatedAt = new Date().toISOString();
+
+  const reflectionText =
+    typeof session.reflectionText === 'string'
+      ? session.reflectionText
+      : row.reflection_text || '';
+
+  db.prepare('UPDATE mistakes SET reflection_text = ?, reflection_session = ? WHERE id = ? AND user_id = ?').run(
+    reflectionText,
+    JSON.stringify(session),
+    id,
+    req.user!.id,
+  );
+
+  res.json({ ok: true, session });
 });
 
 app.delete('/api/mistakes/:id', requireAuth, (req, res) => {
@@ -1867,6 +1954,10 @@ app.use(
       res.status(400).json({ error: '请求体不是有效的 JSON，请检查客户端是否发送了合法 JSON' });
       return;
     }
+    if (err && typeof err === 'object' && 'type' in err && (err as { type: string }).type === 'entity.too.large') {
+      res.status(413).json({ error: '上传图片过大，请换更小图片或压缩后再试（建议单张 < 8MB）' });
+      return;
+    }
     if (err instanceof SyntaxError && err.message.includes('JSON')) {
       res.status(400).json({ error: '请求体 JSON 解析失败' });
       return;
@@ -1900,6 +1991,25 @@ app.use(
 );
 
 const HOST = process.env.HOST || '0.0.0.0';
-app.listen(PORT, HOST, () => {
+const server = app.listen(PORT, HOST, () => {
   printListenUrls(PORT, serveStatic ? 'full' : 'api');
 });
+
+server.on('error', (err: NodeJS.ErrnoException) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(
+      `[zhishitree] 端口 ${PORT} 已被占用（常见于 tsx 热重载）。请结束占用进程后重试，或设置 API_PORT 换端口。`,
+    );
+    process.exit(1);
+  }
+  throw err;
+});
+
+function shutdown(signal: string) {
+  console.log(`[zhishitree] 收到 ${signal}，正在释放端口 ${PORT}…`);
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 5000).unref();
+}
+
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+process.once('SIGINT', () => shutdown('SIGINT'));

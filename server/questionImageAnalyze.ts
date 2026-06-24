@@ -25,7 +25,24 @@ import {
   EXAM_PAPER_RECOGNITION_SKILL_ID,
   type ExamPaperOcrMeta,
 } from './examPaperRecognition.js';
-import { recognizeExamViaService } from './examRecognitionService.js';
+import {
+  postprocessExamStemOcr,
+  recognizeExamViaService,
+} from './examRecognitionService.js';
+import {
+  blankHandwritingInStemOcr,
+  isGarbageHandwritingText,
+  preprocessImageForRedHandwriting,
+  preprocessImageForStemOcr,
+  isStemOverShrunk,
+  postProcessHandwrittenPair,
+  supplementBlackWrongFill,
+  supplementBlackDirectionFill,
+  supplementRedCorrectionFill,
+  supplementRedDerivationFill,
+  sanitizeHandwrittenAnswers,
+  stripHandwritingFromOcrText,
+} from './examImageInkPreprocess.js';
 import { extractExamTextFromBuffer } from './paperFileExtract.js';
 
 function isPdfMime(mimeType: string): boolean {
@@ -65,6 +82,12 @@ export type QuestionAnalysis = {
   circuitDescription?: string;
   /** exam-paper-recognition 流水线元数据（便于确认识别路径） */
   ocrMeta?: ExamPaperOcrMeta;
+  /** 识别预览排版：块顺序、字号、配图宽度 */
+  ocrLayout?: {
+    v: 1;
+    order?: string[];
+    styles: Record<string, { widthPct?: number; fontScale?: number; marginTop?: number; align?: string }>;
+  };
 };
 
 export type { ExamPaperOcrMeta } from './examPaperRecognition.js';
@@ -99,7 +122,7 @@ const QUESTION_ANALYSIS_SCHEMA = {
     pitfalls: {
       type: Type.ARRAY,
       items: { type: Type.STRING },
-      description: '常见易错点列表',
+      description: '本题具体易错陷阱（挂钩题干/选项/数据，非泛泛知识点）',
     },
     knowledgeTree: {
       type: Type.ARRAY,
@@ -116,10 +139,13 @@ const QUESTION_ANALYSIS_SCHEMA = {
         required: ['node', 'children'],
       },
     },
-    summary: { type: Type.STRING, description: '一句话考点总结（核心考查点，勿复述题干）' },
+    summary: {
+      type: Type.STRING,
+      description: '题目摘要：核心信息 + 作答要求 + 审题要诀（分条，换行分隔）',
+    },
     specificMistake: {
       type: Type.STRING,
-      description: '具体错误分析（Markdown）',
+      description: '错因定位：从学生错答出发反推可能原因（Markdown）',
     },
     circuitDescription: {
       type: Type.STRING,
@@ -181,18 +207,102 @@ function isOcrRefusal(text: string): boolean {
 }
 
 function buildHandwrittenAnswersPrompt(): string {
-  return `【任务】按笔迹颜色区分并转录题目图片中的手写作答。
+  return `【任务】仅转录题目图片中的**手写作答**（用笔写的笔迹），按颜色分为 black / red 两栏。
 
-【颜色区分（重要）】
-- **黑色笔迹**：学生最初做题时写下的**原始答案**（圈选选项、填空、计算过程、草稿等）
-- **红色笔迹**：事后批改/订正时写上的内容（老师或学生用红笔标注的**正确答案**、改错、勾画等）
-- 印刷体题目、印刷体选项 → **不要**抄写
-- 蓝笔等其他颜色：一般忽略；若无法区分黑/红时可简要记入 black
+【先排除印刷体（必做）】
+- 试卷/书本印刷的题干、题号、选项文字、表头 → **一律不抄写**
+- 印刷体特征：字体统一、墨色均匀、与版面对齐；手写字迹笔画粗细不一、有连笔或涂改
+- 黑色手写可能与印刷体相邻（填空横线旁、括号内、表格空格内），仍属 black
+
+【颜色含义 — 务必按墨水颜色分栏，不可猜】
+- **black（黑色笔迹）**：学生最初用黑笔写下的内容；**被划掉/涂改的黑笔填答仍属 black**（如划掉的 5，写「5（划掉）」）
+- **red（红色笔迹）**：红笔事后批改/订正；填空旁红笔改写的数字（如把 5 改成 2，则 black=5（划掉），red=2）
+- 同一位置既有黑笔划掉又有红笔改写时，**禁止把红笔内容放进 black**
+
+【常见题型】
+- 填空订正：black 抄被划掉的黑笔原答 + 未改动的填答；red 抄红笔改正（仅红墨水写的部分）
+- 选择题：black 抄学生圈选；red 抄红笔改正选项
+- 计算题：black 抄黑色草稿；red 抄红笔订正（勿与 black 重复）
 
 【输出】只输出一个 JSON 对象，不要 Markdown 代码块，不要其他文字：
 {"black":"黑色手写内容","red":"红色手写内容"}
 - 没有某颜色笔迹时，对应键值为空字符串 ""
+- 多条内容用中文分号「；」分隔（JSON 字符串内不要换行）
 - 看不清用 [?]`;
+}
+
+/** 红笔掩膜图 / 原图：专用于提取红色批改笔迹 */
+function buildRedHandwrittenOnlyPrompt(): string {
+  return `【任务】本图突出显示**红色墨水**手写作答，请**仅**转录红色笔迹。
+
+【必排除】
+- 黑色笔迹（含被划掉的黑笔数字）、印刷体题干与选项
+
+【要抄写】
+- 红笔在填空/括号旁改写的**数字或符号**（如 2、12N）
+- 红笔批注、改错、订正后的选项
+- **不要抄**「水平向左/水平向右」等方向词（那些通常是黑笔填答，除非明显为红墨水所写）
+- 仅有红勾/红叉/红线无文字时写「（红色勾画标记）」
+
+【输出】只输出 JSON：
+{"red":"红色手写内容"}
+无红色手写时 {"red":""}`;
+}
+
+/** 红笔已去除的净化图：专用于补提黑色手写（避免红笔干扰、漏识黑笔） */
+function buildBlackHandwrittenOnlyPrompt(): string {
+  return `【任务】本图已去除红/蓝批改笔迹，请**仅**转录图中剩余的**黑色手写作答**。
+
+【必排除】
+- 印刷体题干、题号、选项、表头、图中标注字母（如 A、B、M）——即使与手写相邻也不要抄
+- 涂改、潦草难辨的草稿行；中英符号混杂的乱码（如含 #、?、孤立大写字母的行）
+
+【要抄写】
+- 横线/括号/表格空格内学生用黑笔填入的数值、文字、选项（如 5（划掉）、水平向左、B）
+- **填空横线上被划掉的黑笔数字**（如先写5又划掉）必须抄为「5（划掉）」；红笔订正数字（如2）不要抄入黑栏
+- **被划掉的黑笔填答必须抄写**，在数字或文字后加「（划掉）」
+- 按题序用「；」分隔；每条尽量短（一般不超过 20 字）
+
+【输出】只输出 JSON，不要其他文字：
+{"black":"黑色手写内容"}
+无黑色手写或无法辨认时输出 {"black":""}`;
+}
+
+/** 从模型输出中宽松提取 black/red（兼容 JSON 内未转义换行等） */
+function extractHandwrittenJsonFields(text: string): { black: string; red: string } | null {
+  const trimmed = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
+  const obj = extractJsonObject(trimmed);
+  if (obj) {
+    try {
+      const parsed = JSON.parse(obj) as { black?: string; red?: string; blackAnswer?: string; redAnswer?: string };
+      return {
+        black: String(parsed.black ?? parsed.blackAnswer ?? '').trim(),
+        red: String(parsed.red ?? parsed.redAnswer ?? '').trim(),
+      };
+    } catch {
+      // fall through to regex
+    }
+  }
+  const pick = (key: 'black' | 'red'): string => {
+    const re = new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`, 's');
+    const m = trimmed.match(re);
+    if (m) return m[1].replace(/\\n/g, '\n').replace(/\\"/g, '"').trim();
+    const loose = new RegExp(`"${key}"\\s*:\\s*"([\\s\\S]*?)"\\s*,\\s*"(?:red|black)"`, 's');
+    const m2 = trimmed.match(loose);
+    if (m2) return m2[1].replace(/\\n/g, '\n').trim();
+    return '';
+  };
+  const black = pick('black');
+  const red = pick('red');
+  if (!black && !red) return null;
+  return { black, red };
+}
+
+function formatHandwrittenList(text: string): string {
+  return text
+    .replace(/；/g, '\n')
+    .replace(/;\s*/g, '\n')
+    .trim();
 }
 
 function normalizeHandwrittenField(text: string, color: 'black' | 'red'): string {
@@ -209,23 +319,174 @@ function normalizeHandwrittenField(text: string, color: 'black' | 'red'): string
 
 function parseHandwrittenAnswersResponse(text: string): { originalAnswer: string; correctedAnswer: string } {
   const trimmed = text.trim();
-  try {
-    const parsed = parseJsonFromText<{ black?: string; red?: string; blackAnswer?: string; redAnswer?: string }>(
-      trimmed,
-    );
-    const blackRaw = String(parsed.black ?? parsed.blackAnswer ?? '').trim();
-    const redRaw = String(parsed.red ?? parsed.redAnswer ?? '').trim();
+  const fields = extractHandwrittenJsonFields(trimmed);
+  if (fields) {
     return {
-      originalAnswer: normalizeHandwrittenField(blackRaw, 'black'),
-      correctedAnswer: normalizeHandwrittenField(redRaw, 'red'),
-    };
-  } catch {
-    // 兼容旧版纯文本（仅黑色）
-    return {
-      originalAnswer: normalizeHandwrittenField(trimmed, 'black'),
-      correctedAnswer: '',
+      originalAnswer: formatHandwrittenList(normalizeHandwrittenField(fields.black, 'black')),
+      correctedAnswer: formatHandwrittenList(normalizeHandwrittenField(fields.red, 'red')),
     };
   }
+  // 兼容旧版纯文本（仅黑色）
+  return {
+    originalAnswer: formatHandwrittenList(normalizeHandwrittenField(trimmed, 'black')),
+    correctedAnswer: '',
+  };
+}
+
+/** 调用视觉模型转录手写（单次） */
+async function callHandwrittenVisionOnce(
+  ocrCfg: Pick<ResolvedAiConfig, 'apiKey' | 'modelId' | 'provider' | 'baseUrl'>,
+  base64: string,
+  mimeType: string,
+  prompt: string,
+  modelIdHint?: string,
+): Promise<string> {
+  if (ocrCfg.provider === 'gemini') {
+    return generateGeminiVisionPlainText(ocrCfg, base64, mimeType, prompt);
+  }
+  if (ocrCfg.provider === 'zhipu') {
+    const envHw = process.env.ZHIPU_HANDWRITTEN_MODEL?.trim();
+    const candidates = modelIdHint
+      ? [modelIdHint]
+      : envHw
+        ? [normalizeModelId('zhipu', envHw)]
+        : resolveZhipuVisionModelCandidates(ocrCfg.modelId).slice(0, 2);
+    let lastErr = '';
+    for (const modelId of candidates) {
+      if (!modelId) continue;
+      try {
+        return await callZhipuVisionOnce(ocrCfg, base64, mimeType, prompt, modelId);
+      } catch (e) {
+        lastErr = e instanceof Error ? e.message : String(e);
+        if (/余额不足|无可用资源包|请充值/i.test(lastErr)) throw e;
+      }
+    }
+    throw new Error(lastErr || '智谱视觉手写识别失败');
+  }
+  const geminiBoost = resolveGeminiCredentials();
+  if (geminiBoost?.apiKey && process.env.AI_OCR_USE_GEMINI !== '0') {
+    try {
+      return await generateGeminiVisionPlainText(geminiBoost, base64, mimeType, prompt);
+    } catch (e) {
+      if (isGeminiProxyError(e)) {
+        return generateGeminiVisionPlainTextDirect(geminiBoost, base64, mimeType, prompt);
+      }
+      throw e;
+    }
+  }
+  throw new Error('当前 AI 提供商不支持手写识别');
+}
+
+function resolveHandwrittenVisionModelCandidates(configuredModelId: string): string[] {
+  const envHw = process.env.ZHIPU_HANDWRITTEN_MODEL?.trim();
+  if (envHw) return [normalizeModelId('zhipu', envHw)];
+  const pool = resolveZhipuVisionModelCandidates(configuredModelId);
+  const preferred = ['glm-4.6v', 'glm-4v-flash', 'glm-4v-plus'];
+  const out: string[] = [];
+  for (const id of preferred) {
+    const n = normalizeModelId('zhipu', id);
+    if (pool.includes(n) && !out.includes(n)) out.push(n);
+  }
+  for (const id of pool) if (!out.includes(id)) out.push(id);
+  return out.slice(0, 3);
+}
+
+function isHandwritingNoiseRecoveryEnabled(): boolean {
+  return process.env.AI_HW_RECOVER_FROM_NOISE === '1';
+}
+
+function isSplitColorHandwritingEnabled(): boolean {
+  return process.env.AI_HANDWRITTEN_SPLIT_COLOR !== '0' && process.env.EXAM_INK_PREPROCESS !== '0';
+}
+
+async function callHandwrittenVisionBest(
+  ocrCfg: Pick<ResolvedAiConfig, 'apiKey' | 'modelId' | 'provider' | 'baseUrl'>,
+  base64: string,
+  mimeType: string,
+  prompt: string,
+): Promise<string> {
+  if (ocrCfg.provider === 'zhipu') {
+    const candidates = resolveHandwrittenVisionModelCandidates(ocrCfg.modelId);
+    let balanceExhausted = false;
+    let lastErr = '';
+    for (const modelId of candidates) {
+      if (!modelId) continue;
+      if (balanceExhausted && /4v-plus/i.test(modelId)) continue;
+      try {
+        return await callZhipuVisionOnce(ocrCfg, base64, mimeType, prompt, modelId);
+      } catch (e) {
+        lastErr = e instanceof Error ? e.message : String(e);
+        if (/余额不足|无可用资源包|请充值/i.test(lastErr)) balanceExhausted = true;
+      }
+    }
+    if (lastErr) throw new Error(lastErr);
+  }
+  return callHandwrittenVisionOnce(ocrCfg, base64, mimeType, prompt);
+}
+
+function parseBlackHandwrittenResponse(text: string): string {
+  if (isOcrRefusal(text)) return '';
+  const fields = extractHandwrittenJsonFields(text);
+  const raw = fields ? fields.black : text;
+  const formatted = formatHandwrittenList(normalizeHandwrittenField(raw, 'black'));
+  return isGarbageHandwritingText(formatted) ? '' : formatted;
+}
+
+function parseRedHandwrittenResponse(text: string): string {
+  if (isOcrRefusal(text)) return '';
+  const fields = extractHandwrittenJsonFields(text);
+  const raw = fields ? fields.red : text;
+  const formatted = formatHandwrittenList(normalizeHandwrittenField(raw, 'red'));
+  return isGarbageHandwritingText(formatted) ? '' : formatted;
+}
+
+/** 分色图双通道：净化图提黑笔，红墨掩膜图提红笔 */
+async function extractHandwrittenAnswersSplitColor(
+  ocrCfg: Pick<ResolvedAiConfig, 'apiKey' | 'modelId' | 'provider' | 'baseUrl'>,
+  base64: string,
+  mimeType: string,
+): Promise<{ originalAnswer: string; correctedAnswer: string } | null> {
+  const raw = stripBase64Prefix(base64);
+  const [stem, redMask] = await Promise.all([
+    preprocessImageForStemOcr(base64, mimeType),
+    preprocessImageForRedHandwriting(base64, mimeType),
+  ]);
+  if (!stem && !redMask) return null;
+
+  const blackPrompt = buildBlackHandwrittenOnlyPrompt();
+  const redPrompt = buildRedHandwrittenOnlyPrompt();
+
+  const [blackText, redFromMask, redFromOriginal] = await Promise.all([
+    stem
+      ? callHandwrittenVisionBest(ocrCfg, stem.base64, stem.mimeType, blackPrompt).catch(() => '')
+      : Promise.resolve(''),
+    redMask
+      ? callHandwrittenVisionBest(ocrCfg, redMask.base64, redMask.mimeType, redPrompt).catch(() => '')
+      : Promise.resolve(''),
+    callHandwrittenVisionBest(ocrCfg, raw, mimeType, redPrompt).catch(() => ''),
+  ]);
+
+  let originalAnswer = parseBlackHandwrittenResponse(blackText);
+  let correctedAnswer =
+    parseRedHandwrittenResponse(redFromMask) || parseRedHandwrittenResponse(redFromOriginal);
+
+  if (!originalAnswer && stem) {
+    try {
+      const text = await callHandwrittenVisionBest(ocrCfg, raw, mimeType, blackPrompt);
+      originalAnswer = parseBlackHandwrittenResponse(text);
+    } catch {
+      // ignore
+    }
+  }
+
+  if (!originalAnswer && !correctedAnswer) return null;
+
+  const merged = postProcessHandwrittenPair(originalAnswer, correctedAnswer);
+  console.log(
+    `[zhishitree] 分色手写识别 black=${merged.originalAnswer.length} red=${merged.correctedAnswer.length}` +
+      ` (stem=${stem?.stats.redPixels ?? 0}px红已掩膜)`,
+  );
+  return sanitizeHandwrittenAnswers(merged);
 }
 
 /** 视觉模型按颜色识别手写答案：黑=原始作答，红=批改正确答案 */
@@ -241,7 +502,7 @@ async function extractHandwrittenAnswers(
 
   const apply = (text: string, modelId?: string) => {
     if (isOcrRefusal(text)) return empty;
-    const parsed = parseHandwrittenAnswersResponse(text);
+    const parsed = sanitizeHandwrittenAnswers(parseHandwrittenAnswersResponse(text));
     if (parsed.originalAnswer || parsed.correctedAnswer) {
       console.log(
         `[zhishitree] 手写答案识别成功${modelId ? ` (${modelId})` : ''} black=${parsed.originalAnswer.length} red=${parsed.correctedAnswer.length}`,
@@ -251,31 +512,107 @@ async function extractHandwrittenAnswers(
   };
 
   try {
-    if (ocrCfg.provider === 'gemini') {
-      const text = await generateGeminiVisionPlainText(ocrCfg, raw, mimeType, prompt);
-      return apply(text);
+    if (isSplitColorHandwritingEnabled()) {
+      const split = await extractHandwrittenAnswersSplitColor(ocrCfg, base64, mimeType);
+      if (split?.originalAnswer || split?.correctedAnswer) {
+        return split;
+      }
+      console.warn('[zhishitree] 分色手写识别无结果，回退双色合图识别');
     }
+
+    let result = empty;
+
     if (ocrCfg.provider === 'zhipu') {
-      const candidates = resolveZhipuVisionModelCandidates(ocrCfg.modelId).slice(0, 3);
+      const candidates = resolveHandwrittenVisionModelCandidates(ocrCfg.modelId);
+      let balanceExhausted = false;
       for (const modelId of candidates) {
+        if (!modelId) continue;
+        if (balanceExhausted && /4v-plus/i.test(modelId)) continue;
         try {
           const text = await callZhipuVisionOnce(ocrCfg, raw, mimeType, prompt, modelId);
-          const parsed = apply(text, modelId);
-          if (parsed.originalAnswer || parsed.correctedAnswer) return parsed;
+          result = apply(text, modelId);
+          if (result.originalAnswer || result.correctedAnswer) break;
         } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
           console.warn(`[zhishitree] 手写答案识别失败 (${modelId}):`, e);
+          if (/余额不足|无可用资源包|请充值/i.test(msg)) balanceExhausted = true;
+        }
+      }
+      if (balanceExhausted) {
+        console.warn('[zhishitree] 智谱视觉模型余额不足，跳过付费回退模型');
+      }
+    } else {
+      try {
+        const text = await callHandwrittenVisionOnce(ocrCfg, raw, mimeType, prompt);
+        result = apply(text);
+      } catch (e) {
+        console.warn('[zhishitree] 手写答案识别失败:', e);
+      }
+    }
+
+    if (!result.originalAnswer && !result.correctedAnswer) {
+      const geminiBoost = resolveGeminiCredentials();
+      if (geminiBoost?.apiKey && process.env.AI_OCR_USE_GEMINI !== '0' && ocrCfg.provider !== 'gemini') {
+        try {
+          const text = await generateGeminiVisionPlainText(geminiBoost, raw, mimeType, prompt);
+          result = apply(text);
+        } catch (e) {
+          if (isGeminiProxyError(e)) {
+            const text = await generateGeminiVisionPlainTextDirect(geminiBoost, raw, mimeType, prompt);
+            result = apply(text);
+          }
         }
       }
     }
-    const geminiBoost = resolveGeminiCredentials();
-    if (geminiBoost?.apiKey && process.env.AI_OCR_USE_GEMINI !== '0') {
-      const text = await generateGeminiVisionPlainText(geminiBoost, raw, mimeType, prompt);
-      return apply(text);
+
+    // 黑笔漏识：在红笔已去除的净化图上补提一次
+    if (!result.originalAnswer.trim()) {
+      const stem = await preprocessImageForStemOcr(base64, mimeType);
+      if (stem && (stem.stats.redPixels > 0 || stem.stats.bluePixels > 0)) {
+        try {
+          const blackPrompt = buildBlackHandwrittenOnlyPrompt();
+          const text = await callHandwrittenVisionOnce(
+            ocrCfg,
+            stem.base64,
+            stem.mimeType,
+            blackPrompt,
+          );
+          const fields = extractHandwrittenJsonFields(text);
+          const black = fields
+            ? formatHandwrittenList(normalizeHandwrittenField(fields.black, 'black'))
+            : formatHandwrittenList(normalizeHandwrittenField(text, 'black'));
+          if (black.trim() && !isGarbageHandwritingText(black)) {
+            console.log(`[zhishitree] 黑笔补提成功（净化图）len=${black.length}`);
+            result = { ...result, originalAnswer: black };
+          } else if (black.trim()) {
+            console.warn('[zhishitree] 黑笔补提结果为 OCR 乱码，已丢弃');
+          }
+        } catch (e) {
+          console.warn('[zhishitree] 黑笔补提失败:', e instanceof Error ? e.message : e);
+        }
+      }
     }
+
+    return sanitizeHandwrittenAnswers(postProcessHandwrittenPair(result.originalAnswer, result.correctedAnswer));
   } catch (e) {
     console.warn('[zhishitree] 手写答案识别失败:', e);
   }
   return empty;
+}
+
+function geminiErrorMessage(e: unknown): string {
+  if (!(e instanceof Error)) return String(e);
+  const parts = [e.message];
+  let cur: unknown = e.cause;
+  for (let i = 0; i < 3 && cur; i++) {
+    parts.push(cur instanceof Error ? cur.message : String(cur));
+    cur = cur instanceof Error ? cur.cause : undefined;
+  }
+  return parts.join(' | ');
+}
+
+function isGeminiProxyError(e: unknown): boolean {
+  return /ECONNREFUSED|proxy|7890/i.test(geminiErrorMessage(e));
 }
 
 function buildOcrPrompt(): string {
@@ -318,18 +655,33 @@ function buildAnalysisFromTextPrompt(
     );
   }
   const handBlock = blocks.length ? `\n${blocks.join('\n\n')}\n` : '';
-  const handHint =
-    blocks.length > 0
-      ? '\n若同时有黑色原始作答与红色批改答案，specificMistake 应对比两者说明错在哪里、正确应是什么。\n'
-      : '';
+  const hasBothAnswers =
+    Boolean(handwritten?.originalAnswer?.trim()) && Boolean(handwritten?.correctedAnswer?.trim());
+  const hasAnyAnswer = blocks.length > 0;
+  const handHint = hasAnyAnswer
+    ? hasBothAnswers
+      ? `
+**错因定位（specificMistake）必须从学生错答出发反推**，按以下 Markdown 结构输出（保留 **作答对比** 标题，错因用 \`- \` 列表，**不要再写「可能的原因」标题**）：
+1. **作答对比**：一句话点明原始作答 vs 批改答案的差异（如「选 C，正确为 A」），并说明正确选项依据题干/选项哪一点。
+2. 以错答为起点，分条列出 2～4 条**可能原因**（用 \`- \` 列表）：每条只写一种可能的思维误区或知识盲区（一句话说清，可点明对应题干/选项依据）；**不要写「错答表现」「答错表现」等前缀**，界面会显示为「可能原因是：」供学生勾选。
+`
+      : `
+**错因定位（specificMistake）须从上方手写错答出发反推**，Markdown 输出：**作答对比**（若有）+ 2～4 条 \`- \` 可能原因（每条一句话、勿写「错答表现」前缀，**不要写「可能的原因」标题**）。
+`
+    : `
+**错因定位（specificMistake）**：无手写答案时，根据题目常见错选/错填，推测 2～4 条可能错因（\`- \` 列表，勿写「可能的原因」标题）。
+`;
+  const specificMistakeRule = hasAnyAnswer
+    ? '- specificMistake：字符串，Markdown，含 **作答对比** + 从错答反推的错因列表（见上，勿重复「可能的原因」标题）'
+    : '- specificMistake：字符串，错因定位（Markdown，2～4 条 \`- \` 列表，从常见错答推测，勿写「可能的原因」标题）';
   return `你是初中科学（含物理）教师。下面是一道题目的 OCR 原文，请**严格基于原文**分析。
 ${handBlock}${handHint}
 **只输出一个 JSON 对象**，不要 Markdown 代码块，不要任何 JSON 之外的文字。JSON 键名固定为：
 - knowledgePoints：字符串数组，2～6 条核心考点
-- pitfalls：字符串数组，1～4 条易错点
+- pitfalls：字符串数组，2～4 条**本题易错点**（须挂钩本题题干、选项、表格数据或配图细节，说明「这道题」哪里容易看错/选错/算错；不要写泛泛的学科常识）
 - knowledgeTree：数组，元素形如 {"node":"物理-电学","children":["欧姆定律"]}
-- summary：字符串，一句话考点总结（写考查的核心知识点/能力，勿复述题干原文）
-- specificMistake：字符串，错因/难点（Markdown，简洁）
+- summary：字符串，**题目摘要**（3～5 条要点，**每条必须单独占一行**（换行分隔）；用「核心信息：」「作答要求：」「审题要诀：」前缀；同一类型有多条时分多行写；须教学生如何从题干/表格/配图提取有价值信息，勿整段复述 OCR 原文）
+${specificMistakeRule}
 - circuitDescription：字符串，若有电路图则简述连接关系，否则 ""
 
 **禁止**在 JSON 中重复输出 rawOcrText（OCR 原文过长，已由系统保存）。
@@ -489,23 +841,30 @@ async function generateGeminiVisionPlainText(
   mimeType: string,
   prompt: string,
 ): Promise<string> {
-  return runWithGeminiNetwork(async () => {
-    const ai = createGeminiClient(cfg.apiKey);
-    const model = resolveVisionModelId('gemini', cfg.modelId);
-    const response = await ai.models.generateContent({
-      model,
-      contents: {
-        parts: [
-          { inlineData: { data: base64, mimeType } },
-          { text: prompt },
-        ],
-      },
-      config: { temperature: 0 },
-    });
-    const text = response.text?.trim();
-    if (!text) throw new Error('模型未返回 OCR 内容');
-    return text;
+  return runWithGeminiNetwork(async () => generateGeminiVisionPlainTextDirect(cfg, base64, mimeType, prompt));
+}
+
+async function generateGeminiVisionPlainTextDirect(
+  cfg: Pick<ResolvedAiConfig, 'apiKey' | 'modelId'>,
+  base64: string,
+  mimeType: string,
+  prompt: string,
+): Promise<string> {
+  const ai = createGeminiClient(cfg.apiKey);
+  const model = resolveVisionModelId('gemini', cfg.modelId);
+  const response = await ai.models.generateContent({
+    model,
+    contents: {
+      parts: [
+        { inlineData: { data: base64, mimeType } },
+        { text: prompt },
+      ],
+    },
+    config: { temperature: 0 },
   });
+  const text = response.text?.trim();
+  if (!text) throw new Error('模型未返回 OCR 内容');
+  return text;
 }
 
 async function generateGeminiOcrJson(
@@ -908,6 +1267,17 @@ async function analyzeQuestionImageOnePass(
   });
 }
 
+async function resolveStemOcrImageInput(
+  base64: string,
+  mimeType: string,
+): Promise<{ ocrBase64: string; ocrMimeType: string }> {
+  const preprocessed = await preprocessImageForStemOcr(base64, mimeType);
+  if (preprocessed) {
+    return { ocrBase64: preprocessed.base64, ocrMimeType: preprocessed.mimeType };
+  }
+  return { ocrBase64: base64, ocrMimeType: mimeType };
+}
+
 export async function analyzeQuestionImageWithAi(
   activeCfg: Pick<ResolvedAiConfig, 'apiKey' | 'modelId' | 'provider' | 'baseUrl'>,
   base64: string,
@@ -937,8 +1307,9 @@ export async function analyzeQuestionImageWithAi(
     }
   }
 
+  const stemOcr = await resolveStemOcrImageInput(base64, mimeType);
   const { text: ocrText, circuitDescription, source, figures: ocrFigures, ocrMeta } =
-    await extractOcrFromImage(ocrCfg, base64, mimeType, engine);
+    await extractOcrFromImage(ocrCfg, stemOcr.ocrBase64, stemOcr.ocrMimeType, engine);
   if (!ocrText.trim()) {
     throw new Error('OCR 未识别到文字，请换更清晰的图片重试');
   }
@@ -979,12 +1350,14 @@ export async function recognizeQuestionImageOnly(
   }
 
   const ocrCfg = resolveOcrCredentials(activeCfg as ResolvedAiConfig) ?? activeCfg;
-  const { text, circuitDescription, source, figures, ocrMeta } = await extractOcrFromImage(
-    ocrCfg,
-    base64,
-    mimeType,
-    engine,
-  );
+  const stemOcr = await resolveStemOcrImageInput(base64, mimeType);
+
+  const [ocrResult, handwritten] = await Promise.all([
+    extractOcrFromImage(ocrCfg, stemOcr.ocrBase64, stemOcr.ocrMimeType, engine),
+    extractHandwrittenAnswers(ocrCfg, base64, mimeType),
+  ]);
+
+  const { text, circuitDescription, source, figures, ocrMeta } = ocrResult;
   if (!text.trim()) {
     throw new Error('OCR 未识别到文字，请换更清晰的图片重试');
   }
@@ -999,21 +1372,76 @@ export async function recognizeQuestionImageOnly(
   }
 
   const piped = applyExamPaperRecognitionPipeline(finalText.trim());
+  const stripped = stripHandwritingFromOcrText(piped.fullText, handwritten);
+  let stemText = stripped.text.trim();
+  if (!stemText || isStemOverShrunk(piped.fullText, stemText)) {
+    const noiseOnly = stripHandwritingFromOcrText(piped.fullText).text.trim();
+    stemText = noiseOnly.length > stemText.length ? noiseOnly : stemText;
+  }
+  if (!stemText || isStemOverShrunk(piped.fullText, stemText)) {
+    stemText = piped.fullText.trim();
+    console.warn('[zhishitree] 题干保留 OCR 原文（去手写过度）');
+  }
+  stemText = postprocessExamStemOcr(stemText);
+  let originalAnswer = handwritten.originalAnswer;
+  let correctedAnswer = handwritten.correctedAnswer;
+  originalAnswer = supplementBlackWrongFill(
+    originalAnswer || '',
+    stemText,
+    correctedAnswer,
+  );
+  correctedAnswer = supplementRedCorrectionFill(
+    originalAnswer || '',
+    stemText,
+    correctedAnswer,
+  );
+  if (!correctedAnswer?.trim() && stripped.recoveredRedDerivation?.trim()) {
+    correctedAnswer = stripped.recoveredRedDerivation;
+  }
+  correctedAnswer = supplementRedDerivationFill(
+    originalAnswer || '',
+    stemText,
+    correctedAnswer,
+  );
+  if (!originalAnswer?.trim() && isHandwritingNoiseRecoveryEnabled() && stripped.recoveredBlack.trim()) {
+    const recovered = sanitizeHandwrittenAnswers({ originalAnswer: stripped.recoveredBlack }).originalAnswer;
+    if (recovered) {
+      originalAnswer = recovered;
+      console.log(`[zhishitree] 从 OCR 噪声回收黑笔短答 len=${originalAnswer.length}`);
+    }
+  }
   console.log(
-    `[zhishitree] [${ocrMeta.pipeline}] 识别环节完成 engine=${engine} len=${piped.fullText.length}`,
+    `[zhishitree] [${ocrMeta.pipeline}] 识别环节完成 engine=${engine} len=${stemText.length}` +
+      (stemText.length !== piped.fullText.length ? `（去手写 ${piped.fullText.length - stemText.length} 字）` : ''),
   );
 
-  const { originalAnswer, correctedAnswer } = await extractHandwrittenAnswers(ocrCfg, base64, mimeType);
   if (originalAnswer || correctedAnswer) {
     console.log(
-      `[zhishitree] 手写答案 black=${originalAnswer.length} red=${correctedAnswer.length}`,
+      `[zhishitree] 手写答案 black=${originalAnswer?.length ?? 0} red=${correctedAnswer?.length ?? 0}`,
     );
   }
 
+  const finalHw = sanitizeHandwrittenAnswers(
+    postProcessHandwrittenPair(originalAnswer || '', correctedAnswer || ''),
+  );
+  const withDirs = supplementBlackDirectionFill(finalHw.originalAnswer, stemText);
+  const finalOut = sanitizeHandwrittenAnswers({
+    originalAnswer: withDirs,
+    correctedAnswer: finalHw.correctedAnswer,
+  });
+  stemText = blankHandwritingInStemOcr(stemText, finalOut);
+
+  const figs = figures ?? [];
+  const rawData = stripBase64Prefix(base64);
+  const rawOcrText = embedAnalysisFigurePlaceholders(stemText, figs, {
+    mime: mimeType || 'image/jpeg',
+    data: rawData,
+  });
+
   return {
-    rawOcrText: piped.fullText,
-    originalAnswer: originalAnswer || undefined,
-    correctedAnswer: correctedAnswer || undefined,
+    rawOcrText,
+    originalAnswer: finalOut.originalAnswer || undefined,
+    correctedAnswer: finalOut.correctedAnswer || undefined,
     circuitDescription: finalCircuit,
     figures,
     ocrMeta,

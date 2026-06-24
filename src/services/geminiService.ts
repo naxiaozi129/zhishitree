@@ -18,6 +18,10 @@ export interface QuestionAnalysis {
   knowledgeTree: KnowledgeNode[];
   summary: string;
   specificMistake: string;
+  /** 黑色笔迹：学生原始作答 */
+  originalAnswer?: string;
+  /** 红色笔迹：批改后的正确答案 */
+  correctedAnswer?: string;
   sourceImage?: { mime: string; data: string };
   figures?: QuestionFigure[];
   circuitDescription?: string;

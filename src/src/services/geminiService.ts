@@ -1,3 +1,7 @@
+import type { OcrContentLayout } from '../utils/examContentLayout';
+
+export type { OcrContentLayout };
+
 export interface KnowledgeNode {
   node: string;
   children: any[];
@@ -31,6 +35,8 @@ export interface QuestionAnalysis {
     source: 'mineru' | 'vision';
     mineruBackend?: string;
   };
+  /** 识别预览区文字/配图块排版（位置顺序、字号、图片宽度） */
+  ocrLayout?: OcrContentLayout;
 }
 
 export interface KnowledgePointDetails {
@@ -93,19 +99,71 @@ export function resolveCircuitImageUri(
   return resolveAnalysisImageUri(analysis, fallbackDataUrl);
 }
 
+/** 比较两张 data URL / 外链是否指向同一张图（用于去重侧边栏配图） */
+export function imageUriFingerprint(uri: string | null | undefined): string {
+  if (!uri) return '';
+  const base64 = uri.replace(/^data:[^;]+;base64,/, '').trim();
+  if (base64.length >= 64) return base64.slice(0, 128);
+  return uri;
+}
+
+export function isSameImageUri(
+  a: string | null | undefined,
+  b: string | null | undefined,
+): boolean {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  return imageUriFingerprint(a) === imageUriFingerprint(b);
+}
+
 async function postAnalyze<T>(path: string, body: Record<string, unknown>): Promise<T> {
-  const res = await fetch(path, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    credentials: 'include',
-    body: JSON.stringify(body),
-  });
-  const data = (await res.json().catch(() => ({}))) as {
+  let res: Response;
+  try {
+    res = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(
+      /fetch|network|failed/i.test(msg)
+        ? '无法连接后端 API，请确认终端已运行 npm run dev:all'
+        : msg || '网络请求失败',
+    );
+  }
+
+  const text = await res.text();
+  let data = {} as {
     error?: string;
     analysis?: T;
     details?: T;
     recognition?: T;
   };
+  if (text.trim()) {
+    try {
+      data = JSON.parse(text) as typeof data;
+    } catch {
+      if (res.status === 500 || res.status === 502 || res.status === 504) {
+        throw new Error(
+          res.status === 504
+            ? '识别超时，请换更小的图片或稍后重试'
+            : '后端未响应或开发代理中断，请确认 npm run dev:all 正在运行后刷新重试',
+        );
+      }
+      throw new Error('服务器返回了非 JSON 内容');
+    }
+  } else if (!res.ok) {
+    throw new Error(
+      res.status === 504
+        ? '识别超时，请换更小的图片或稍后重试'
+        : res.status === 500 || res.status === 502
+          ? '后端未响应或开发代理中断，请确认 npm run dev:all 正在运行后刷新重试'
+          : `请求失败（HTTP ${res.status}）`,
+    );
+  }
+
   if (!res.ok) {
     throw new Error(data.error || `请求失败（HTTP ${res.status}）`);
   }
@@ -121,6 +179,7 @@ export type QuestionRecognitionResult = {
   circuitDescription?: string;
   figures?: QuestionFigure[];
   ocrMeta?: QuestionAnalysis['ocrMeta'];
+  ocrLayout?: OcrContentLayout;
 };
 
 export async function recognizeQuestionImage(
